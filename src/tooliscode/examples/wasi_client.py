@@ -40,17 +40,18 @@ def main():
 
     # 4) File I/O scoped to session dir
     print("\n== alpha: write a file inside alpha dir ==")
-    r5 = srv.exec_cell("alpha", 'open("alpha.txt","w").write("hello alpha"); print("ok")')
+    r5 = srv.exec_cell("alpha", f'open("alpha.txt","w").write("hello alpha"); print("ok")')
     print(r5.stdout.strip())
-    print("alpha file present?", os.path.exists(os.path.join(ROOT, "alpha", "alpha.txt")))
+    new_file = os.path.join(ROOT, "alpha", "alpha.txt")
+    print("alpha file present?", os.path.exists(new_file))
     print("beta can’t see it from Python (different preopen):")
     r6 = srv.exec_cell("beta", 'import os; print(os.path.exists("alpha.txt"))')
     print(r6.stdout.strip())
 
     # 5) Timeout demo (busy loop). Expect exit_code 124 and error message.
-    print("\n== alpha: timeout after 500 ms ==")
-    r7 = srv.exec_cell("alpha", "while True: pass", timeout_ms=500)
-    print("ok:", r7.ok, "error:", r7.error, "wall_ms:", r7.wall_ms)
+    # print("\n== alpha: timeout after 500 ms ==")
+    # r7 = srv.exec_cell("alpha", "while True: pass", timeout_ms=500)
+    # print("ok:", r7.ok, "error:", r7.error, "wall_ms:", r7.wall_ms)
 
     # 6) Reset session "alpha"
     print("\n== alpha: reset and verify x is gone ==")

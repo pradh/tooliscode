@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import wasmtime  # pip install wasmtime
 
@@ -23,6 +23,8 @@ G = {"__name__": "__main__"}  # persistent globals
 SIDEDIR = os.path.dirname(__file__)          # <— this is the session dir
 SIDELOG = os.path.join(SIDEDIR, "_shim.log")
 
+os.chdir(SIDEDIR)
+
 def _sidelog(msg):
     try:
         with open(SIDELOG, "a", buffering=1) as f:  # line-buffered
@@ -34,11 +36,19 @@ _sidelog(f"shim boot: starting up {sys.stdin.isatty()} and {sys.stdin.buffer.raw
 
 
 def _lp_read():
-    line = sys.stdin.readline()
-    _sidelog(f"_lp_read header={line!r}")
-    if not line:
+    fin = sys.stdin.buffer
+    header = bytearray()
+    while True:
+        ch = fin.read(1)
+        if not ch:
+            return None  # EOF before header
+        if ch == b"\\n":
+            break
+        header += ch
+    n = int(header.decode("ascii"))
+    _sidelog(f"_lp_read header={n}")
+    if not n:
         return None
-    n = int(line.strip())
     data = bytearray()
     while len(data) < n:
         chunk = sys.stdin.buffer.read(n - len(data))
@@ -51,10 +61,10 @@ def _lp_read():
 def _lp_write(obj):
     b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     _sidelog(f"_lp_write payload_len={len(b)}")
-    sys.stdout.write(str(len(b)) + "\\n")
-    sys.stdout.flush()
-    sys.stdout.buffer.write(b)
-    sys.stdout.flush()
+    fout = sys.stdout.buffer
+    fout.write(str(len(b)).encode("ascii") + b"\\n")
+    fout.write(b)
+    fout.flush()
 
 def run_cell(src: str):
     _sidelog(f"run_cell start len={len(src)}")
@@ -114,10 +124,10 @@ def _trace(msg: str) -> None:
 
 def _lp_write(stdin_stream: Any, obj: dict) -> None:
     payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    x = f"{len(payload)}\n".encode("utf-8")
-    stdin_stream.write(x)
+    header = f"{len(payload)}\n".encode("utf-8")
+    _trace(f"[host] lp_write header={len(header)} payload={len(payload)}")
+    stdin_stream.write(header)
     stdin_stream.write(payload)
-    print("lp_write: first", x, len(payload))
 
 
 def _lp_read(stdout_stream: Any, max_bytes: int = 2_000_000) -> dict:
@@ -140,7 +150,7 @@ def _lp_read(stdout_stream: Any, max_bytes: int = 2_000_000) -> dict:
         if not chunk:
             raise EOFError("guest stdout closed mid-frame")
         data += chunk
-    print("lp_read: ", length, data)
+    _trace(f"[host] lp_read framesz={length} bytes={len(data)}")
     return json.loads(data.decode("utf-8"))
 
 
@@ -173,6 +183,7 @@ class _FifoWriter:
             if n <= 0:
                 raise RuntimeError("FIFO write failed")
             sent += n
+            _trace(f"[host] fifo write chunk={n} total={sent}/{len(view)}")
 
     def close(self) -> None:
         os.close(self._fd)
