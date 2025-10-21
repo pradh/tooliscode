@@ -9,33 +9,55 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import wasmtime  # pip install wasmtime
 
 
 _SHIM_STR = """
 # _shim.py — persistent "cell runner" inside python.wasm
-import sys, json, io, contextlib, traceback
+import sys, json, io, contextlib, traceback, os, time
 
 G = {"__name__": "__main__"}  # persistent globals
 
+SIDEDIR = os.path.dirname(__file__)          # <— this is the session dir
+SIDELOG = os.path.join(SIDEDIR, "_shim.log")
+
+def _sidelog(msg):
+    try:
+        with open(SIDELOG, "a", buffering=1) as f:  # line-buffered
+            f.write(f"[{time.time():.3f}] {msg}\\n")
+    except Exception:
+        pass
+
+_sidelog(f"shim boot: starting up {sys.stdin.isatty()} and {sys.stdin.buffer.raw}")
+
+
 def _lp_read():
     line = sys.stdin.readline()
+    _sidelog(f"_lp_read header={line!r}")
     if not line:
         return None
     n = int(line.strip())
-    data = sys.stdin.buffer.read(n)
+    data = bytearray()
+    while len(data) < n:
+        chunk = sys.stdin.buffer.read(n - len(data))
+        _sidelog(f"_lp_read payload_len={len(data)}")
+        if not chunk:
+            raise EOFError("stdin closed mid-frame")
+        data.extend(chunk)
     return json.loads(data)
 
 def _lp_write(obj):
     b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    _sidelog(f"_lp_write payload_len={len(b)}")
     sys.stdout.write(str(len(b)) + "\\n")
     sys.stdout.flush()
     sys.stdout.buffer.write(b)
     sys.stdout.flush()
 
 def run_cell(src: str):
+    _sidelog(f"run_cell start len={len(src)}")
     out, err = io.StringIO(), io.StringIO()
     ok, eobj = True, None
     try:
@@ -45,23 +67,42 @@ def run_cell(src: str):
         ok, eobj = False, {"type": "SystemExit", "msg": str(e)}
     except Exception as e:
         ok, eobj = False, {"type": type(e).__name__, "msg": str(e), "trace": traceback.format_exc()}
+    _sidelog(f"run_cell done ok={ok} out={len(out.getvalue())} err={len(err.getvalue())}")
     return {"ok": ok, "stdout": out.getvalue(), "stderr": err.getvalue(), "error": eobj}
 
 if __name__ == "__main__":
-    while True:
-        req = _lp_read()
-        if not req:
-            break
-        t = req.get("type")
-        if t == "exec":
-            _lp_write(run_cell(req.get("code", "")))
-        elif t == "reset":
-            G.clear(); G["__name__"] = "__main__"
-            _lp_write({"ok": True})
-        elif t == "exit":
-            _lp_write({"ok": True}); break
-        else:
-            _lp_write({"ok": False, "error": {"msg": f"unknown type: {t}"}})
+    try:
+        while True:
+            try:
+                _sidelog("Waiting on read")
+                req = _lp_read()
+            except Exception as e:
+                _sidelog(f"_lp_read error: {type(e).__name__}: {e}")
+                _lp_write({"ok": False, "error": {"type": type(e).__name__, "msg": str(e), "trace": traceback.format_exc()}})
+                break
+            if not req:
+                _sidelog("EOF on stdin")
+                break
+            t = req.get("type")
+            _sidelog(f"recv type={t}")
+            try:
+                if t == "exec":
+                    _lp_write(run_cell(req.get("code", "")))
+                elif t == "reset":
+                    G.clear(); G["__name__"] = "__main__"
+                    _lp_write({"ok": True})
+                elif t == "exit":
+                    _lp_write({"ok": True}); break
+                else:
+                    _lp_write({"ok": False, "error": {"msg": f"unknown type: {t}"}})
+            except BrokenPipeError as e:
+                _sidelog(f"BrokenPipe during _lp_write: {e}")
+                break
+            except Exception as e:
+                _sidelog(f"_lp_write error: {type(e).__name__}: {e}")
+                break
+    finally:
+        _sidelog("main loop exit")
 """
 
 
@@ -71,41 +112,39 @@ def _trace(msg: str) -> None:
         print(f"[wasi_server] {msg}", file=sys.stderr, flush=True)
 
 
-def _lp_write(stdin_pipe: Any, obj: dict) -> None:
-    """Length-prefix write over the guest stdin stream."""
-    b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    stdin_pipe.write((f"{len(b)}\n").encode("utf-8"))
-    stdin_pipe.write(b)
+def _lp_write(stdin_stream: Any, obj: dict) -> None:
+    payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    x = f"{len(payload)}\n".encode("utf-8")
+    stdin_stream.write(x)
+    stdin_stream.write(payload)
+    print("lp_write: first", x, len(payload))
 
 
-def _lp_read(stdout_pipe: Any, max_bytes: int = 2_000_000) -> dict:
-    """Read a single JSON frame from the guest stdout stream."""
-    line = bytearray()
+def _lp_read(stdout_stream: Any, max_bytes: int = 2_000_000) -> dict:
+    header = bytearray()
     while True:
-        ch = stdout_pipe.read(1)
-        if not ch:
+        chunk = stdout_stream.read(1)
+        if not chunk:
             raise EOFError("guest stdout closed")
-        line += ch
-        if line.endswith(b"\n"):
+        header += chunk
+        if header.endswith(b"\n"):
             break
-        if len(line) > 64:
+        if len(header) > 64:
             raise ValueError("invalid frame header")
-
-    n = int(line.strip() or b"0")
-    if n < 0 or n > max_bytes:
-        raise ValueError(f"frame too large: {n}")
-
+    length = int(header.strip() or b"0")
+    if length < 0 or length > max_bytes:
+        raise ValueError(f"frame too large: {length}")
     data = bytearray()
-    while len(data) < n:
-        chunk = stdout_pipe.read(n - len(data))
+    while len(data) < length:
+        chunk = stdout_stream.read(length - len(data))
         if not chunk:
             raise EOFError("guest stdout closed mid-frame")
         data += chunk
+    print("lp_read: ", length, data)
     return json.loads(data.decode("utf-8"))
 
 
 def _wait_for_fifo_fd(path: str, flags: int, blocking: bool, deadline: Optional[float]) -> int:
-    """Busy-wait until the FIFO endpoint is ready, then return an FD."""
     while True:
         try:
             fd = os.open(path, flags)
@@ -122,33 +161,26 @@ def _wait_for_fifo_fd(path: str, flags: int, blocking: bool, deadline: Optional[
 
 
 class _FifoWriter:
-    """Minimal blocking writer around a FIFO FD."""
-
     def __init__(self, path: str, deadline: Optional[float]) -> None:
         flags = os.O_WRONLY | os.O_NONBLOCK
-        fd = _wait_for_fifo_fd(path, flags, True, deadline)
-        self._fd = fd
+        self._fd = _wait_for_fifo_fd(path, flags, True, deadline)
 
     def write(self, data: bytes) -> None:
         view = memoryview(data)
-        written = 0
-        while written < len(view):
-            n = os.write(self._fd, view[written:])
+        sent = 0
+        while sent < len(view):
+            n = os.write(self._fd, view[sent:])
             if n <= 0:
                 raise RuntimeError("FIFO write failed")
-            written += n
+            sent += n
 
     def close(self) -> None:
         os.close(self._fd)
 
 
 class _FifoReader:
-    """Blocking/non-blocking reader around a FIFO FD."""
-
     def __init__(self, path: str, blocking: bool, deadline: Optional[float]) -> None:
-        flags = os.O_RDONLY
-        if not blocking:
-            flags |= os.O_NONBLOCK
+        flags = os.O_RDONLY | (0 if blocking else os.O_NONBLOCK)
         self._fd = _wait_for_fifo_fd(path, flags, blocking, deadline)
         self._blocking = blocking
 
@@ -156,8 +188,6 @@ class _FifoReader:
         if self._blocking:
             size = n if n and n > 0 else 1
             return os.read(self._fd, size)
-
-        # Non-blocking drain.
         remaining = n if n and n > 0 else None
         chunks: List[bytes] = []
         while True:
@@ -188,28 +218,31 @@ class ExecResult:
     error: Optional[str] = None
 
 
-def _assign_fifo_path(wasi: wasmtime.WasiConfig, name: str, path: str) -> bool:
+def _assign_fifo_path(wasi: wasmtime.WasiConfig, name: str, path: str) -> Optional[int]:
     """
-    Assign a FIFO-backed stdio stream without hanging the wasmtime setter.
-    The setter opens the path immediately, so we temporarily open the FIFO
-    in O_RDWR mode to satisfy the peer requirement before invoking it.
+    Assign a FIFO-backed stdio path. wasmtime immediately opens the file during
+    assignment, so we temporarily open the FIFO in O_RDWR to satisfy both ends
+    and keep that placeholder open until the host attaches real streams.
     """
-    peer_fd = None
+    peer_fd: Optional[int] = None
     try:
         peer_fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
     except OSError as exc:
-        # ENXIO can happen on some platforms if O_RDWR is not supported;
-        # fall through to let wasmtime attempt the open (may still hang).
         if exc.errno not in (errno.ENXIO, errno.ENOENT):
             raise
+        peer_fd = None
+
     try:
         setattr(wasi, f"{name}_file", path)
-    finally:
+        return peer_fd
+    except Exception:
         if peer_fd is not None:
             try:
                 os.close(peer_fd)
             except OSError:
                 pass
+        raise
+
 
 class _Session:
     """
@@ -249,10 +282,14 @@ class _Session:
             _trace(f"[session {sid}] interrupt handle unavailable")
 
         self.linker = wasmtime.Linker(self.engine)
+        self.linker.define_wasi()
+
         wasi = wasmtime.WasiConfig()
 
         session_alias = os.environ.get("WASI_SESSION_GUEST")
         self._session_guest_path = self._preopen_dir(wasi, self.sdir, session_alias)
+
+        self._ensure_shim_exists()
 
         wasi.argv = ["python", "-u", f"{self._session_guest_path}/_shim.py"]
 
@@ -268,6 +305,7 @@ class _Session:
         self._stdout = None
         self._stderr = None
         self._fifo_paths: Optional[Dict[str, str]] = None
+        self._fifo_placeholders: Dict[str, int] = {}
         self._use_pipe = hasattr(wasmtime, "Pipe")
 
         if self._use_pipe:
@@ -281,26 +319,17 @@ class _Session:
             _trace(f"[session {sid}] falling back to FIFO stdio")
             self._fifo_paths = self._prepare_fifos()
             for name, path in self._fifo_paths.items():
-                _assign_fifo_path(wasi, name, path)
+                fd = _assign_fifo_path(wasi, name, path)
+                if fd is not None:
+                    self._fifo_placeholders[name] = fd
 
-        if hasattr(self.store, "set_wasi"):
-            self.store.set_wasi(wasi)
+        self.store.set_wasi(wasi)
+
+        if not self._use_pipe:
+            self._attach_fifo_streams()
         else:
-            try:
-                self.store.wasi = wasi  # type: ignore[attr-defined]
-            except AttributeError:
-                _trace(f"[session {sid}] store missing WASI setter")
+            _trace(f"[session {sid}] pipe streams ready")
 
-        define_wasi = getattr(self.linker, "define_wasi", None)
-        if callable(define_wasi):
-            try:
-                define_wasi(wasi)
-            except TypeError:
-                define_wasi()
-        else:
-            _trace(f"[session {sid}] linker missing define_wasi")
-
-        self._ensure_shim_exists()
         inst = self.linker.instantiate(self.store, self.module)
 
         def _run_guest() -> None:
@@ -317,11 +346,6 @@ class _Session:
         )
         _trace(f"[session {sid}] About to start guest")
         self._guest_thread.start()
-
-        if not self._use_pipe:
-            self._attach_fifo_streams()
-        else:
-            _trace(f"[session {sid}] pipe streams ready")
 
         self._lock = threading.Lock()
         _trace(f"[session {sid}] init complete")
@@ -412,7 +436,6 @@ class _Session:
                 handle.write(_SHIM_STR)
 
     def _prepare_fifos(self) -> Dict[str, str]:
-        assert not self._use_pipe
         mapping = {
             "stdin": os.path.join(self.sdir, "_stdin.fifo"),
             "stdout": os.path.join(self.sdir, "_stdout.fifo"),
@@ -434,10 +457,20 @@ class _Session:
             self._stdin = _FifoWriter(self._fifo_paths["stdin"], deadline)
             self._stdout = _FifoReader(self._fifo_paths["stdout"], True, deadline)
             self._stderr = _FifoReader(self._fifo_paths["stderr"], False, deadline)
+            _trace(f"[session {self.sid}] fifo streams attached")
         except Exception:
             self._cleanup_stdio()
             raise
-        _trace(f"[session {self.sid}] fifo streams attached")
+        finally:
+            self._release_fifo_placeholders()
+
+    def _release_fifo_placeholders(self) -> None:
+        for fd in list(self._fifo_placeholders.values()):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fifo_placeholders.clear()
 
     def _ensure_guest_running(self) -> None:
         if self._guest_thread is None:
@@ -568,6 +601,7 @@ class _Session:
                     os.unlink(path)
                 except FileNotFoundError:
                     pass
+        self._release_fifo_placeholders()
 
 
 class WasiPythonServer:

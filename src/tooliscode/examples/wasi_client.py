@@ -2,6 +2,8 @@
 from __future__ import annotations
 import os, textwrap
 from tooliscode.wasi_server import WasiPythonServer
+import shutil
+
 
 ROOT = "/tmp/tooliscode"
 PY_WASM = os.environ.get("PYTHON_WASM", "/opt/wasm/python.wasm")
@@ -9,7 +11,8 @@ PY_WASM = os.environ.get("PYTHON_WASM", "/opt/wasm/python.wasm")
 # 1) Prepare session dirs and write the shim if it's not present
 def ensure_session_dir(sid: str):
     sdir = os.path.join(ROOT, sid)
-    os.makedirs(sdir, exist_ok=True)
+    shutil.rmtree(sdir, ignore_errors=True)
+    os.makedirs(sdir)
 
 def main():
     # Ensure session dirs + shims exist
