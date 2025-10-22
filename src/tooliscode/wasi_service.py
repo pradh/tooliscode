@@ -615,7 +615,7 @@ class _Session:
         self._release_fifo_placeholders()
 
 
-class WasiPythonServer:
+class WasiService:
     """
     Manages one host process with multiple CPython-WASI sessions.
     Each session is isolated to /tmp/tooliscode/<sid>.

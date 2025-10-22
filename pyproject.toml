@@ -21,7 +21,7 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
 ]
-dependencies = ["openai", "wasmtime"]
+dependencies = ["openai", "pydantic>=2.0", "wasmtime"]
 
 [project.optional-dependencies]
 dev = [

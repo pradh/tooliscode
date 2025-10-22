@@ -23,8 +23,10 @@ pytest
 ruff check src tests
 ```
 
-## Next Steps
 
-- Replace placeholder metadata (URLs, description, author details) with project specifics.
-- Fill in real package code under `src/tooliscode/`.
-- Add tests under `tests/` and extend the CLI as needed.
+## Function Tool Bridging (Design Draft)
+
+1. Provision per-session side-channel FIFOs (e.g., `<sid>/tool_req.pipe` and `<sid>/tool_res.pipe`) alongside the existing shim so guest code can communicate without using stdout or stderr.
+2. Generate Python stubs inside the WASI guest for every Responses API function tool; each stub serializes a canonical `function_call` payload (name, id, arguments) and writes it to `tool_req.pipe`.
+3. Block the stub on responses by reading `tool_res.pipe`, matching on the request id, then materialize the result into a deterministic file (`<sid>/<item_id>.json`) while returning an appropriate Python object.
+4. Run a host-side handler thread that watches `tool_req.pipe`, invokes the real API callback, and writes the `tool_result` payload back through `tool_res.pipe`, propagating errors as structured messages.

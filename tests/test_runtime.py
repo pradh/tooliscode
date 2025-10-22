@@ -1,0 +1,70 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+import threading
+from pathlib import Path
+
+import pytest
+from pydantic import BaseModel
+
+ROOT = Path(__file__).resolve().parents[2]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.append(str(SRC))
+
+from tooliscode import runtime as runtime_mod
+from tooliscode.runtime import ToolCallError, tool_call
+
+
+class EchoArgs(BaseModel):
+    text: str
+
+
+def test_tool_call_round_trip(tmp_path, monkeypatch):
+    req_pipe = tmp_path / "tool_req.pipe"
+    resp_pipe = tmp_path / "tool_res.pipe"
+    os.mkfifo(req_pipe)
+    os.mkfifo(resp_pipe)
+
+    monkeypatch.setenv("TOOLISCODE_SESSION_DIR", str(tmp_path))
+    monkeypatch.delenv("TOOLISCODE_TOOL_REQ", raising=False)
+    monkeypatch.delenv("TOOLISCODE_TOOL_RES", raising=False)
+
+    ack = threading.Event()
+
+    def responder():
+        with open(req_pipe, "r", encoding="utf-8") as req_fh:
+            line = req_fh.readline()
+            payload = json.loads(line)
+            ack.set()
+            response = {
+                "type": "tool_result",
+                "id": payload["id"],
+                "content": {"echo": payload["arguments"]["text"]},
+            }
+            with open(resp_pipe, "w", encoding="utf-8", buffering=1) as resp_fh:
+                resp_fh.write(json.dumps(response))
+                resp_fh.write("\n")
+                resp_fh.flush()
+
+    thread = threading.Thread(target=responder, daemon=True)
+    thread.start()
+
+    result = tool_call("echo", EchoArgs(text="hi"), timeout=5.0)
+
+    assert ack.is_set(), "responder thread did not receive request"
+    assert result["type"] == "tool_result"
+    assert result["content"]["echo"] == "hi"
+    thread.join(timeout=1)
+    runtime_mod._session_runtimes.clear()
+
+
+def test_tool_call_missing_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("TOOLISCODE_SESSION_DIR", raising=False)
+    monkeypatch.delenv("TOOLISCODE_TOOL_REQ", raising=False)
+    monkeypatch.delenv("TOOLISCODE_TOOL_RES", raising=False)
+
+    with pytest.raises(ToolCallError):
+        tool_call("noop", EchoArgs(text="hi"), timeout=0.1)
