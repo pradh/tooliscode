@@ -123,87 +123,6 @@ class _FifoReader:
         os.close(self._fd)
 
 
-class _ToolRequestWorker:
-    def __init__(self, sid: str, callback: ToolCallback, req_path: str, resp_path: str) -> None:
-        self._sid = sid
-        self._callback = callback
-        self._req_path = req_path
-        self._resp_path = resp_path
-        self._stop_event = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"tooliscode-host-{sid}",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        try:
-            with open(self._req_path, "w", encoding="utf-8", buffering=1) as pipe:
-                pipe.write("\n")
-                pipe.flush()
-        except OSError:
-            pass
-        self._thread.join(timeout=1)
-
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                with open(self._req_path, "r", encoding="utf-8", buffering=1) as req_fh:
-                    for line in req_fh:
-                        if self._stop_event.is_set():
-                            return
-                        payload = line.strip()
-                        if not payload:
-                            continue
-                        try:
-                            message = json.loads(payload)
-                        except json.JSONDecodeError:
-                            _trace(f"[session {self._sid}] invalid tool request json")
-                            continue
-                        self._handle_request(message)
-            except FileNotFoundError:
-                return
-            except OSError as exc:
-                if self._stop_event.is_set():
-                    return
-                _trace(f"[session {self._sid}] tool request read error: {exc}")
-                time.sleep(0.1)
-
-    def _handle_request(self, message: dict) -> None:
-        request_id = message.get("id")
-        if not request_id:
-            return
-        name = message.get("name") or ""
-        arguments = message.get("arguments") or {}
-        try:
-            result = self._callback(name, request_id, arguments)
-        except Exception as exc:  # pragma: no cover - defensive
-            _trace(f"[session {self._sid}] tool callback error: {exc}")
-            response = {
-                    "type": "tool_result",
-                    "id": request_id,
-                    "error": {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    },
-            }
-        else:
-            assert isinstance(result, dict)
-            response = result.copy()
-            response.setdefault("type", "tool_result")
-            response.setdefault("id", request_id)
-
-        try:
-            with open(self._resp_path, "w", encoding="utf-8", buffering=1) as resp_fh:
-                resp_fh.write(json.dumps(response, ensure_ascii=False))
-                resp_fh.write("\n")
-                resp_fh.flush()
-        except OSError as exc:
-            _trace(f"[session {self._sid}] tool response write error: {exc}")
-
-
 @dataclass
 class ExecResult:
     ok: bool
@@ -241,7 +160,7 @@ def _assign_fifo_path(wasi: wasmtime.WasiConfig, name: str, path: str) -> Option
 
 class _Session:
     """
-    One long-lived CPython-WASI instance running `runtime.py` inside /tmp/tooliscode/<sid>.
+    One long-lived CPython-WASI instance running `guest.py` inside /tmp/tooliscode/<sid>.
     Maintains persistent Python globals via the shim loop.
     """
 
@@ -285,9 +204,9 @@ class _Session:
         session_alias = os.environ.get("WASI_SESSION_GUEST")
         self._session_guest_path = self._preopen_dir(wasi, self.sdir, session_alias)
 
-        self._ensure_runtime_exists()
+        self._ensure_guest_files()
 
-        wasi.argv = ["python", "-u", f"{self._session_guest_path}/runtime.py"]
+        wasi.argv = ["python", "-u", f"{self._session_guest_path}/guest.py"]
 
         env_map = self._setup_python_runtime(wasi, wasm_path)
         py_path = env_map.setdefault("PYTHONPATH", [])
@@ -303,8 +222,6 @@ class _Session:
         self._fifo_paths: Optional[Dict[str, str]] = None
         self._fifo_placeholders: Dict[str, int] = {}
         self._use_pipe = hasattr(wasmtime, "Pipe")
-        self._tool_worker: Optional[_ToolRequestWorker] = None
-        self._tool_req_path, self._tool_resp_path = self._init_tool_channel()
 
         if self._use_pipe:
             _trace(f"[session {sid}] using wasmtime.Pipe for stdio")
@@ -346,7 +263,6 @@ class _Session:
         self._guest_thread.start()
 
         self._lock = threading.Lock()
-        self._tool_worker = _ToolRequestWorker(self.sid, self.callback, self._tool_req_path, self._tool_resp_path)
         _trace(f"[session {sid}] init complete")
 
     def exec_cell(self, code: str, timeout_ms: int = 8000) -> ExecResult:
@@ -369,9 +285,9 @@ class _Session:
             try:
                 self._ensure_guest_running()
                 _trace(f"[session {self.sid}] guest is running")
-                _lp_write(self._stdin, {"type": "exec", "code": code})
+                _lp_write(self._stdin, {"type": "exec_request", "code": code})
                 _trace(f"[session {self.sid}] wrote to it, now reading")
-                resp = _lp_read(self._stdout)
+                resp = self._wait_for_exec_result()
             except wasmtime.Trap:
                 err_text = f"Timeout after {timeout_ms} ms" if timed_out else "Trap"
                 resp = {"ok": False, "stdout": "", "stderr": "", "error": {"msg": err_text}}
@@ -391,6 +307,7 @@ class _Session:
                 f"[session {self.sid}] exec done ok={resp.get('ok')} wall={wall}ms "
                 f"stdout_len={len(resp.get('stdout') or '')} stderr_len={len(stderr)}"
             )
+            _trace(resp)
 
             return ExecResult(
                 ok=bool(resp.get("ok")),
@@ -399,6 +316,46 @@ class _Session:
                 wall_ms=int(wall),
                 error=(resp.get("error") or {}).get("msg") if resp.get("error") else err_text,
             )
+
+    def _wait_for_exec_result(self) -> Dict[str, Any]:
+        while True:
+            resp = _lp_read(self._stdout)
+            if not isinstance(resp, dict):
+                continue
+            msg_type = resp.get("type")
+            if msg_type == "tool_request":
+                self._handle_tool_request(resp)
+                continue
+            if msg_type is None:
+                resp["type"] = "exec_result"
+            return resp
+
+    def _handle_tool_request(self, message: dict) -> None:
+        request_id = message.get("id")
+        if not request_id:
+            _trace(f"[session {self.sid}] tool request missing id")
+            return
+        name = message.get("name") or ""
+        arguments = message.get("arguments") or {}
+        try:
+            result = self.callback(name, request_id, arguments)
+        except Exception as exc:  # pragma: no cover - defensive
+            _trace(f"[session {self.sid}] tool callback error: {exc}")
+            response = {
+                "type": "tool_result",
+                "id": request_id,
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            }
+        else:
+            assert isinstance(result, dict)
+            response = result.copy()
+            response.setdefault("type", "tool_result")
+            response.setdefault("id", request_id)
+
+        _lp_write(self._stdin, response)
 
     def reset(self) -> None:
         with self._lock:
@@ -428,27 +385,12 @@ class _Session:
             raise FileNotFoundError(f"python.wasm not found at {path}")
         return path
 
-    def _ensure_runtime_exists(self) -> None:
-        runtime_dst_path = os.path.join(self.sdir, "runtime.py")
-        if not os.path.isfile(runtime_dst_path):
-            runtime_src_path = os.path.join(os.path.dirname(__file__), "runtime.py")
-            shutil.copyfile(runtime_src_path, runtime_dst_path)
-
-    def _init_tool_channel(self) -> Tuple[str, str]:
-        req_path = os.path.join(self.sdir, "tool_req.pipe")
-        resp_path = os.path.join(self.sdir, "tool_res.pipe")
-        for path in (req_path, resp_path):
-            if os.path.exists(path):
-                try:
-                    mode = os.stat(path).st_mode
-                except OSError:
-                    mode = None
-                if not mode or not stat.S_ISFIFO(mode):
-                    os.unlink(path)
-                    os.mkfifo(path, 0o600)
-            else:
-                os.mkfifo(path, 0o600)
-        return req_path, resp_path
+    def _ensure_guest_files(self) -> None:
+        for f in ["guest.py", "guest_helpers.py"]:
+            dst_path = os.path.join(self.sdir, f)
+            if not os.path.isfile(dst_path):
+                src_path = os.path.join(os.path.dirname(__file__), f)
+                shutil.copyfile(src_path, dst_path)
 
     def _prepare_fifos(self) -> Dict[str, str]:
         mapping = {
@@ -601,9 +543,6 @@ class _Session:
         return alias
 
     def _cleanup_stdio(self) -> None:
-        if self._tool_worker is not None:
-            self._tool_worker.stop()
-            self._tool_worker = None
         for stream in (self._stdin, self._stdout, self._stderr):
             if stream is None:
                 continue
@@ -620,13 +559,6 @@ class _Session:
                 except FileNotFoundError:
                     pass
         self._release_fifo_placeholders()
-        for path in (self._tool_req_path, self._tool_resp_path):
-            if not path:
-                continue
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
 
 
 class WasiService:

@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
+import runpy
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.append(str(SRC))
-
-from tooliscode.functions import ToolFunctionEmitter  # noqa: E402
+MODULE_GLOBALS = runpy.run_path(SRC / "tooliscode" / "functions.py")
+ToolFunctionEmitter = MODULE_GLOBALS["ToolFunctionEmitter"]
 
 
 def test_tool_generation_includes_docstrings_and_aliases() -> None:
@@ -43,17 +41,11 @@ def test_tool_generation_includes_docstrings_and_aliases() -> None:
 
     expected_lines = [
         "from __future__ import annotations",
+        "import os, sys",
+        "sys.path.append(os.path.dirname(__file__))",
+        "",
         "from typing import Any, Literal, Optional",
-        "from pydantic import BaseModel, ConfigDict, Field",
-        "from tooliscode.runtime import tool_call",
-        "",
-        "class GetWeatherArgs(BaseModel):",
-        '    """Pydantic model for `get_weather` arguments."""',
-        "    model_config = ConfigDict(populate_by_name=True)",
-        "",
-        "    city: str = Field(..., description='City name')",
-        "    units: Literal['metric', 'imperial'] = Field('metric', description='Unit system')",
-        "    include_hourly: bool = Field(None, description='Include hourly data', alias='include-hourly')",
+        "from guest_helpers import tool_call",
         "",
         "def get_weather(city: str, units: Literal['metric', 'imperial'] = 'metric', include_hourly: Optional[bool] = None) -> Any:",
         '    """',
@@ -64,8 +56,14 @@ def test_tool_generation_includes_docstrings_and_aliases() -> None:
         "        units: Unit system",
         "        include_hourly: Include hourly data (alias: `include-hourly`)",
         '    """',
-        "    args = GetWeatherArgs(city=city, units=units, include_hourly=include_hourly)",
-        "    return tool_call('session-123', 'get_weather', args)",
+        "    args: dict[str, Any] = {}",
+        "    for _param_name, _param_value in [",
+        "        ('city', city),",
+        "        ('units', units),",
+        "        ('include-hourly', include_hourly),",
+        "    ]:",
+        "        args[_param_name] = _param_value",
+        "    return tool_call('get_weather', args)",
     ]
     expected = "\n".join(expected_lines) + "\n"
 
@@ -95,21 +93,23 @@ def test_tool_generation_handles_nullable_types() -> None:
 
     expected_lines = [
         "from __future__ import annotations",
-        "from typing import Any, Optional",
-        "from pydantic import BaseModel, Field",
-        "from tooliscode.runtime import tool_call",
+        "import os, sys",
+        "sys.path.append(os.path.dirname(__file__))",
         "",
-        "class UpdateCountArgs(BaseModel):",
-        '    """Pydantic model for `update_count` arguments."""',
-        "    count: int = Field(None, description='Optional count override')",
+        "from typing import Any, Optional",
+        "from guest_helpers import tool_call",
         "",
         "def update_count(count: Optional[int] = None) -> Any:",
         '    """',
         "    Args:",
         "        count: Optional count override",
         '    """',
-        "    args = UpdateCountArgs(count=count)",
-        "    return tool_call('session-123', 'update_count', args)",
+        "    args: dict[str, Any] = {}",
+        "    for _param_name, _param_value in [",
+        "        ('count', count),",
+        "    ]:",
+        "        args[_param_name] = _param_value",
+        "    return tool_call('update_count', args)",
     ]
     expected = "\n".join(expected_lines) + "\n"
 

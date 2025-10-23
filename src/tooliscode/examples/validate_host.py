@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from tooliscode import NOP_CALLBACK
-from tooliscode.wasi_service import ExecResult, WasiService
+from tooliscode.host import ExecResult, WasiService
 
 ROOT = Path(os.environ.get("TOOLISCODE_ROOT", "/tmp/tooliscode")).resolve()
 PYTHON_WASM = os.environ.get("PYTHON_WASM", "/opt/wasm/python.wasm")

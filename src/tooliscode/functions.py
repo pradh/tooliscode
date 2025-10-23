@@ -63,7 +63,7 @@ class ToolFunctionEmitter:
         if typing_imports:
             lines.append(f"from typing import {', '.join(typing_imports)}")
 
-        lines.append("from runtime import tool_call")
+        lines.append("from guest_helpers import tool_call")
         return lines
 
     def _emit_tool(self, tool: dict) -> list[str]:

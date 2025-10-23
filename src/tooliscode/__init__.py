@@ -6,7 +6,7 @@ from importlib import metadata
 from typing import Optional, Any
 
 from .functions import ToolFunctionEmitter
-from .wasi_service import ToolCallback, WasiService
+from .host import ToolCallback, WasiService
 
 try:  # pragma: no cover - optional dependency
     from openai import OpenAI  # type: ignore

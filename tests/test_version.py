@@ -1,5 +1,13 @@
 """Basic smoke tests for the tooliscode package."""
 
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.append(str(SRC))
+
 from tooliscode import __version__
 
 

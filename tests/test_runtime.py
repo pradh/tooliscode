@@ -1,119 +1,185 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 import pytest
-from pydantic import BaseModel
 
-from tooliscode import runtime as runtime_mod
-from tooliscode.runtime import ToolCallError, tool_call
-from tooliscode.wasi_service import _ToolRequestWorker
-
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.append(str(SRC))
 
+from tooliscode.guest_helpers import ToolCallError, tool_call, ToolRuntime
+from tooliscode.host import _Session
 
-class EchoArgs(BaseModel):
-    text: str
+
+def _read_frame(stream) -> dict:
+    header = bytearray()
+    while True:
+        chunk = stream.read(1)
+        if not chunk:
+            raise EOFError("guest stream closed")
+        header += chunk
+        if header.endswith(b"\n"):
+            break
+        if len(header) > 64:
+            raise ValueError("invalid frame header")
+    length = int(header.strip() or b"0")
+    data = bytearray()
+    while len(data) < length:
+        chunk = stream.read(length - len(data))
+        if not chunk:
+            raise EOFError("guest stream closed mid-frame")
+        data.extend(chunk)
+    return json.loads(data.decode("utf-8"))
 
 
-def test_tool_call_round_trip(tmp_path, monkeypatch):
-    req_pipe = tmp_path / "tool_req.pipe"
-    resp_pipe = tmp_path / "tool_res.pipe"
-    os.mkfifo(req_pipe)
-    os.mkfifo(resp_pipe)
+def _write_frame(stream, message: dict) -> None:
+    payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
+    stream.write(f"{len(payload)}\n".encode("ascii"))
+    stream.write(payload)
+    stream.flush()
 
-    monkeypatch.chdir(tmp_path)
 
-    ack = threading.Event()
+@contextmanager
+def _redirect_guest_io() -> Iterator[tuple[io.BufferedWriter, io.BufferedReader]]:
+    orig_stdin, orig_stdout = sys.stdin, sys.stdout
 
-    def responder():
-        with open(req_pipe, "r", encoding="utf-8") as req_fh:
-            line = req_fh.readline()
-            payload = json.loads(line)
+    stdin_r, stdin_w = os.pipe()
+    stdout_r, stdout_w = os.pipe()
+
+    guest_stdin = io.BufferedReader(os.fdopen(stdin_r, "rb", buffering=0))
+    guest_stdout = io.BufferedWriter(os.fdopen(stdout_w, "wb", buffering=0))
+
+    class _FakeStdin:
+        def __init__(self, buffer: io.BufferedReader) -> None:
+            self.buffer = buffer
+
+        def read(self, n: int = -1) -> str:
+            data = self.buffer.read(n)
+            return data.decode("utf-8") if data else ""
+
+        def readline(self, size: int = -1) -> str:
+            data = self.buffer.readline(size)
+            return data.decode("utf-8") if data else ""
+
+        def fileno(self) -> int:
+            raw = getattr(self.buffer, "raw", None)
+            if raw is not None and hasattr(raw, "fileno"):
+                return raw.fileno()
+            return 0
+
+        def isatty(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            self.buffer.close()
+
+    class _FakeStdout:
+        def __init__(self, buffer: io.BufferedWriter) -> None:
+            self.buffer = buffer
+
+        def write(self, data: str) -> int:
+            encoded = data.encode("utf-8")
+            written = self.buffer.write(encoded)
+            self.buffer.flush()
+            return written
+
+        def flush(self) -> None:
+            self.buffer.flush()
+
+        def isatty(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            self.buffer.close()
+
+    sys.stdin = _FakeStdin(guest_stdin)
+    sys.stdout = _FakeStdout(guest_stdout)
+    ToolRuntime._instance = None
+
+    host_stdin = os.fdopen(stdin_w, "wb", buffering=0)
+    host_stdout = os.fdopen(stdout_r, "rb", buffering=0)
+
+    try:
+        yield host_stdin, host_stdout
+    finally:
+        sys.stdin.close()
+        sys.stdout.close()
+        host_stdin.close()
+        host_stdout.close()
+        sys.stdin = orig_stdin
+        sys.stdout = orig_stdout
+        ToolRuntime._instance = None
+
+
+def test_tool_call_round_trip():
+    with _redirect_guest_io() as (host_stdin, host_stdout):
+        ack = threading.Event()
+
+        def host_worker() -> None:
+            request = _read_frame(host_stdout)
             ack.set()
+            assert request["type"] == "tool_request"
             response = {
                 "type": "tool_result",
-                "id": payload["id"],
-                "content": {"echo": payload["arguments"]["text"]},
+                "id": request["id"],
+                "content": {"echo": request["arguments"]["text"]},
             }
-            with open(resp_pipe, "w", encoding="utf-8", buffering=1) as resp_fh:
-                resp_fh.write(json.dumps(response))
-                resp_fh.write("\n")
-                resp_fh.flush()
+            _write_frame(host_stdin, response)
 
-    thread = threading.Thread(target=responder, daemon=True)
-    thread.start()
+        thread = threading.Thread(target=host_worker, daemon=True)
+        thread.start()
 
-    result = tool_call("alpha", "echo", EchoArgs(text="hi"), timeout=5.0)
+        result = tool_call("echo", {"text": "hello"}, timeout=2.0)
 
-    assert ack.is_set(), "responder thread did not receive request"
-    assert result["type"] == "tool_result"
-    assert result["content"]["echo"] == "hi"
-    thread.join(timeout=1)
-    runtime_mod._session_runtimes.clear()
+        assert ack.is_set(), "host did not receive request"
+        assert result["type"] == "tool_result"
+        assert result["content"]["echo"] == "hello"
+        thread.join(timeout=1.0)
 
 
-def test_tool_call_missing_environment(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-
-    with pytest.raises(ToolCallError):
-        tool_call("alpha", "noop", EchoArgs(text="hi"), timeout=0.1)
-    runtime_mod._session_runtimes.clear()
+def test_tool_call_timeout():
+    with _redirect_guest_io():
+        with pytest.raises(ToolCallError):
+            tool_call("noop", {"text": "late"}, timeout=0.1)
 
 
-def test_tool_request_worker_dispatch(tmp_path):
-    req_pipe = tmp_path / "tool_req.pipe"
-    resp_pipe = tmp_path / "tool_res.pipe"
-    os.mkfifo(req_pipe)
-    os.mkfifo(resp_pipe)
+def test_session_handle_tool_request():
+    responses: list[dict[str, object]] = []
 
-    responses = {}
+    class Buffer(io.BytesIO):
+        def write(self, data: bytes) -> int:
+            return super().write(data)
+
+        def flush(self) -> None:
+            pass
+
+    stdin_buffer = Buffer()
 
     def callback(name: str, request_id: str, arguments: dict[str, object]) -> dict[str, object]:
-        responses[request_id] = {"name": name, "arguments": arguments}
-        return {
-            "type": "tool_result",
-            "id": request_id,
-            "content": {"ok": True, "args": arguments},
-        }
+        responses.append({"name": name, "arguments": arguments})
+        return {"id": request_id, "type": "tool_result", "content": {"ok": True}}
 
-    worker = _ToolRequestWorker("alpha", callback, str(req_pipe), str(resp_pipe))
+    session = _Session.__new__(_Session)  # type: ignore[misc]
+    session.sid = "alpha"  # type: ignore[attr-defined]
+    session.callback = callback  # type: ignore[attr-defined]
+    session._stdin = stdin_buffer  # type: ignore[attr-defined]
 
-    received: dict[str, object] = {}
+    request = {"type": "tool_request", "id": "abc", "name": "echo", "arguments": {"text": "hi"}}
+    _Session._handle_tool_request(session, request)
 
-    def reader() -> None:
-        with open(resp_pipe, "r", encoding="utf-8", buffering=1) as resp_fh:
-            payload = resp_fh.readline().strip()
-            if payload:
-                received.update(json.loads(payload))
-
-    reader_thread = threading.Thread(target=reader, daemon=True)
-    reader_thread.start()
-
-    message = {
-        "type": "function_call",
-        "id": "req-1",
-        "name": "echo",
-        "arguments": {"text": "hi"},
-    }
-    with open(req_pipe, "w", encoding="utf-8", buffering=1) as req_fh:
-        req_fh.write(json.dumps(message))
-        req_fh.write("\n")
-        req_fh.flush()
-
-    reader_thread.join(timeout=1)
-    worker.stop()
-
-    assert "req-1" in responses
-    assert responses["req-1"]["name"] == "echo"
-    assert responses["req-1"]["arguments"] == {"text": "hi"}
-    assert received["type"] == "tool_result"
-    assert received["id"] == "req-1"
-    assert received["content"] == {"ok": True, "args": {"text": "hi"}}
+    written = stdin_buffer.getvalue()
+    assert written, "no response written to stdin"
+    payload = _read_frame(io.BytesIO(written))
+    assert payload["type"] == "tool_result"
+    assert payload["id"] == "abc"
+    assert payload["content"] == {"ok": True}
+    assert responses == [{"name": "echo", "arguments": {"text": "hi"}}]
