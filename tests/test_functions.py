@@ -8,7 +8,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.append(str(SRC))
 
-from tooliscode import ToolIsCode  # noqa: E402
+from tooliscode.functions import ToolFunctionEmitter  # noqa: E402
 
 
 def test_tool_generation_includes_docstrings_and_aliases() -> None:
@@ -39,7 +39,7 @@ def test_tool_generation_includes_docstrings_and_aliases() -> None:
         }
     ]
 
-    generated = ToolIsCode(tools).tools()
+    generated = ToolFunctionEmitter("session-123", tools).render()
 
     expected_lines = [
         "from __future__ import annotations",
@@ -65,7 +65,7 @@ def test_tool_generation_includes_docstrings_and_aliases() -> None:
         "        include_hourly: Include hourly data (alias: `include-hourly`)",
         '    """',
         "    args = GetWeatherArgs(city=city, units=units, include_hourly=include_hourly)",
-        "    return tool_call('get_weather', args)",
+        "    return tool_call('session-123', 'get_weather', args)",
     ]
     expected = "\n".join(expected_lines) + "\n"
 
@@ -91,7 +91,7 @@ def test_tool_generation_handles_nullable_types() -> None:
         }
     ]
 
-    generated = ToolIsCode(tools).tools()
+    generated = ToolFunctionEmitter("session-123", tools).render()
 
     expected_lines = [
         "from __future__ import annotations",
@@ -109,7 +109,7 @@ def test_tool_generation_handles_nullable_types() -> None:
         "        count: Optional count override",
         '    """',
         "    args = UpdateCountArgs(count=count)",
-        "    return tool_call('update_count', args)",
+        "    return tool_call('session-123', 'update_count', args)",
     ]
     expected = "\n".join(expected_lines) + "\n"
 

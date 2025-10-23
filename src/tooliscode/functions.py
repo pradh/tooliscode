@@ -83,7 +83,7 @@ class ToolFunctionEmitter:
         lines: list[str] = []
         lines.extend(self._emit_model(model_name, fn_name, parameters))
         lines.append("")
-        lines.extend(self._emit_function(fn_name, model_name, description, parameters))
+        lines.extend(self._emit_function(fn_name, name, model_name, description, parameters))
         return lines
 
     def _emit_model(self, model_name: str, fn_name: str, parameters: list[_ToolParameter]) -> list[str]:
@@ -111,6 +111,7 @@ class ToolFunctionEmitter:
     def _emit_function(
         self,
         fn_name: str,
+        tool_name: str,
         model_name: str,
         description: str | None,
         parameters: list[_ToolParameter],
@@ -149,7 +150,8 @@ class ToolFunctionEmitter:
 
         init_args = ", ".join(f"{param.name}={param.name}" for param in parameters)
         lines.append(f"    args = {model_name}({init_args})" if init_args else f"    args = {model_name}()")
-        lines.append(f"    return tool_call({self._session_id}, {self._repr(fn_name)}, args)")
+        session_literal = self._repr(self._session_id)
+        lines.append(f"    return tool_call({session_literal}, {self._repr(tool_name)}, args)")
         return lines
 
     def _parse_parameters(self, schema: dict) -> list[_ToolParameter]:

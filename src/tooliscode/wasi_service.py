@@ -740,13 +740,16 @@ class WasiService:
         self.root = os.path.abspath(root)
         self._sessions: Dict[str, _Session] = {}
         self._lock = threading.RLock()
+        os.makedirs(self.root, exist_ok=True)
 
     def create_session(self, callback: ToolCallback) -> str:
         sid = base64.b64encode(secrets.token_bytes(12)).decode("ascii")
         _trace(f"[server] creating session {sid}")
         assert sid not in self._sessions
         with self._lock:
-            self._sessions[sid] = _Session(sid, self.root, callback)
+            session_dir = os.path.join(self.root, sid)
+            os.makedirs(session_dir, exist_ok=True)
+            self._sessions[sid] = _Session(sid, callback, self.root)
         return sid
 
     def exec_cell(self, sid: str, code: str, timeout_ms: int = 8000) -> ExecResult:

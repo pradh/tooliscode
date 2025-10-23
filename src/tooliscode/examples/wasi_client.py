@@ -1,68 +1,85 @@
-# example_wasi_server.py
+"""Simple demo that drives ``tooliscode.wasi_service.WasiService``."""
+
 from __future__ import annotations
-import os, textwrap
-from tooliscode.wasi_server import WasiPythonServer
-import shutil
+
+import os
+from pathlib import Path
+
+from tooliscode import NOP_CALLBACK
+from tooliscode.wasi_service import ExecResult, WasiService
+
+ROOT = Path(os.environ.get("TOOLISCODE_ROOT", "/tmp/tooliscode")).resolve()
+PYTHON_WASM = os.environ.get("PYTHON_WASM", "/opt/wasm/python.wasm")
 
 
-ROOT = "/tmp/tooliscode"
-PY_WASM = os.environ.get("PYTHON_WASM", "/opt/wasm/python.wasm")
+def _print_result(label: str, result: ExecResult) -> None:
+    """Pretty-print the outcome of ``exec_cell`` for the example."""
+    print(f"{label}: ok={result.ok} wall={result.wall_ms}ms")
+    if result.stdout.strip():
+        print("stdout:")
+        print(result.stdout.strip())
+    if result.stderr.strip():
+        print("stderr:")
+        print(result.stderr.strip())
+    if result.error:
+        print(f"error: {result.error}")
+    print("-" * 40)
 
-# 1) Prepare session dirs and write the shim if it's not present
-def ensure_session_dir(sid: str):
-    sdir = os.path.join(ROOT, sid)
-    shutil.rmtree(sdir, ignore_errors=True)
-    os.makedirs(sdir)
 
-def main():
-    # Ensure session dirs + shims exist
-    ensure_session_dir("alpha")
-    ensure_session_dir("beta")
+def main() -> None:
+    # Ensure the python.wasm path is available to the guest.
+    os.environ.setdefault("PYTHON_WASM", PYTHON_WASM)
 
-    # Make sure python.wasm is resolvable for the per-session runners
-    os.environ.setdefault("PYTHON_WASM", PY_WASM)
+    service = WasiService(root=str(ROOT))
+    sessions: list[str] = []
+    try:
+        alpha = service.create_session(NOP_CALLBACK)
+        beta = service.create_session(NOP_CALLBACK)
+        sessions.extend([alpha, beta])
+        print(f"Created sessions alpha={alpha} beta={beta}")
 
-    srv = WasiPythonServer(root=ROOT)
+        _print_result(
+            "alpha: init",
+            service.exec_cell(alpha, 'x = 41\nprint("x =", x)'),
+        )
+        _print_result(
+            "alpha: mutate",
+            service.exec_cell(alpha, 'x += 1\nprint("x now =", x)'),
+        )
 
-    # 2) Basic statefulness: run multiple cells in session "alpha"
-    print("== alpha: define x and increment across turns ==")
-    r1 = srv.exec_cell("alpha", 'x = 41; print("x =", x)')
-    r2 = srv.exec_cell("alpha", 'x += 1; print("x now =", x)')
-    print(r1.stdout.strip())
-    print(r2.stdout.strip())
+        _print_result(
+            "beta: globals",
+            service.exec_cell(beta, 'print("x exists?", "x" in globals())'),
+        )
+        _print_result(
+            "beta: assign",
+            service.exec_cell(beta, 'x = 5\nprint("set x =", x)'),
+        )
 
-    # 3) Isolation: "beta" has its own state, no shared globals with "alpha"
-    print("\n== beta: fresh namespace, x should be undefined until set ==")
-    r3 = srv.exec_cell("beta", 'print("x exists?", "x" in globals())')
-    r4 = srv.exec_cell("beta", 'x = 5; print("set x =", x)')
-    print(r3.stdout.strip())
-    print(r4.stdout.strip())
+        _print_result(
+            "alpha: file",
+            service.exec_cell(alpha, f'open("alpha.txt","w").write("hello alpha"); print("ok")')
+        )
 
-    # 4) File I/O scoped to session dir
-    print("\n== alpha: write a file inside alpha dir ==")
-    r5 = srv.exec_cell("alpha", f'open("alpha.txt","w").write("hello alpha"); print("ok")')
-    print(r5.stdout.strip())
-    new_file = os.path.join(ROOT, "alpha", "alpha.txt")
-    print("alpha file present?", os.path.exists(new_file))
-    print("beta can’t see it from Python (different preopen):")
-    r6 = srv.exec_cell("beta", 'import os; print(os.path.exists("alpha.txt"))')
-    print(r6.stdout.strip())
+        _print_result(
+            "alpha: can see file",
+            service.exec_cell(alpha, 'import os; print(os.path.exists("alpha.txt"))')
+        )
 
-    # 5) Timeout demo (busy loop). Expect exit_code 124 and error message.
-    # print("\n== alpha: timeout after 500 ms ==")
-    # r7 = srv.exec_cell("alpha", "while True: pass", timeout_ms=500)
-    # print("ok:", r7.ok, "error:", r7.error, "wall_ms:", r7.wall_ms)
+        _print_result(
+            "beta: cannot see file",
+            service.exec_cell(beta, 'import os; print(os.path.exists("alpha.txt"))')
+        )
 
-    # 6) Reset session "alpha"
-    print("\n== alpha: reset and verify x is gone ==")
-    srv.reset("alpha")
-    r8 = srv.exec_cell("alpha", 'print("x in globals?", "x" in globals())')
-    print(r8.stdout.strip())
+        service.reset(alpha)
+        _print_result(
+            "alpha: after reset",
+            service.exec_cell(alpha, 'print("x still defined?", "x" in globals())'),
+        )
+    finally:
+        for sid in sessions:
+            service.close(sid)
 
-    # 7) Clean up
-    srv.close("alpha")
-    srv.close("beta")
-    # srv.close_all()  # or close everything
 
 if __name__ == "__main__":
     main()

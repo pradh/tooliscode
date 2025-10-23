@@ -44,13 +44,16 @@ _DEFAULT_CODE_TOOL = {
     },
 }
 
+NOP_CALLBACK: Callable[[str, str, dict[str, object]], dict[str, object]] = lambda x, y, z: {}
+
+
 wasi_service: WasiService | None = None
 
 class ToolIsCode:
     def __init__(
         self,
         tools: list[dict],
-        callback: Optional[ToolCallback] = None,
+        callback: Optional[ToolCallback] = NOP_CALLBACK,
     ) -> None:
         global wasi_service
         if wasi_service is None:
@@ -60,7 +63,7 @@ class ToolIsCode:
         self._sid = wasi_service.create_session(callback)
         self._tool_source = ToolFunctionEmitter(self._sid, self._orig_tools).render()
 
-    def tools(self) -> str:
+    def tools(self) -> list[dict]:
         return [_DEFAULT_CODE_TOOL] + [t for t in self._orig_tools if t.get("type") != "function"]
 
     def instructions(self) -> str:
@@ -71,7 +74,7 @@ class ToolIsCode:
             "selectively open it, to avoid blowing through your context window."
         )
     
-    def tool_call(self, func_call: dict[str, Any]) -> str:
+    def tool_call(self, func_call: dict[str, Any]) -> dict[str, Any]:
         assert func_call.get("type") == "function_call"
         assert func_call.get("name") == "python"
         code = func_call.get("arguments").get("code")
@@ -85,3 +88,6 @@ class ToolIsCode:
             "call_id": func_call.get("call_id"),
             "output": output
         }
+
+    def session_id(self) -> str:
+        return self._sid

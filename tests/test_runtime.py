@@ -14,7 +14,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.append(str(SRC))
 
-from tooliscode import ToolIsCode, get_tool_callback, runtime as runtime_mod, set_tool_callback
+from tooliscode import runtime as runtime_mod
 from tooliscode.runtime import ToolCallError, tool_call
 from tooliscode.wasi_service import _ToolRequestWorker
 
@@ -53,7 +53,7 @@ def test_tool_call_round_trip(tmp_path, monkeypatch):
     thread = threading.Thread(target=responder, daemon=True)
     thread.start()
 
-    result = tool_call("echo", EchoArgs(text="hi"), timeout=5.0)
+    result = tool_call("alpha", "echo", EchoArgs(text="hi"), timeout=5.0)
 
     assert ack.is_set(), "responder thread did not receive request"
     assert result["type"] == "tool_result"
@@ -68,7 +68,7 @@ def test_tool_call_missing_environment(tmp_path, monkeypatch):
     monkeypatch.delenv("TOOLISCODE_TOOL_RES", raising=False)
 
     with pytest.raises(ToolCallError):
-        tool_call("noop", EchoArgs(text="hi"), timeout=0.1)
+        tool_call("alpha", "noop", EchoArgs(text="hi"), timeout=0.1)
 
 
 def test_tool_request_worker_dispatch(tmp_path):
@@ -86,8 +86,6 @@ def test_tool_request_worker_dispatch(tmp_path):
             "id": request_id,
             "content": {"ok": True, "args": arguments},
         }
-
-    ToolIsCode([], callback=callback)
 
     worker = _ToolRequestWorker("alpha", callback, str(req_pipe), str(resp_pipe))
 
@@ -122,6 +120,3 @@ def test_tool_request_worker_dispatch(tmp_path):
     assert received["type"] == "tool_result"
     assert received["id"] == "req-1"
     assert received["content"] == {"ok": True, "args": {"text": "hi"}}
-
-    # Clean up callback for subsequent tests
-    set_tool_callback(previous_callback)
