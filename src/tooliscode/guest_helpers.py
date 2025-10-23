@@ -1,7 +1,6 @@
-
 from __future__ import annotations
 
-import sys, json, os, time, threading, uuid
+import sys, json, os, time, threading, uuid, selectors
 
 from typing import Any
 
@@ -31,7 +30,6 @@ sidelog(f"shim boot: starting up {sys.stdin.isatty()}")
 
 class ToolCallError(RuntimeError):
     """Raised when tool_call cannot complete."""
-
 
 
 def tool_call(function_name: str, args: dict, *, timeout: float = 30.0) -> dict[str, Any]:
@@ -82,7 +80,15 @@ class ToolRuntime:
             raise ToolCallError("Tool runtime is shutting down")
         deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
         while True:
-            message = lp_read()
+            remaining = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ToolCallError("Timed out waiting for tool result")
+            try:
+                message = lp_read(timeout=remaining)
+            except TimeoutError as exc:
+                raise ToolCallError("Timed out waiting for tool result") from exc
             if not isinstance(message, dict):
                 continue
             if not message:
@@ -97,23 +103,50 @@ class ToolRuntime:
         self._closed = True
 
 
-def lp_read():
+def _wait_for_readable(stream, deadline: float | None) -> None:
+    if deadline is None:
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("timed out waiting for frame data")
+    raw = getattr(stream, "raw", stream)
+    fileno = getattr(raw, "fileno", None)
+    if callable(fileno):
+        sel = selectors.DefaultSelector()
+        try:
+            sel.register(raw, selectors.EVENT_READ)
+            ready = sel.select(remaining)
+            if not ready:
+                raise TimeoutError("timed out waiting for frame data")
+        finally:
+            sel.close()
+    else:
+        # Best-effort fallback if fileno is unavailable.
+        time.sleep(min(0.001, remaining))
+
+
+def lp_read(timeout: float | None = None):
     fin = _IO_IN.buffer
+    deadline = time.monotonic() + timeout if timeout is not None else None
     header = bytearray()
     while True:
+        _wait_for_readable(fin, deadline)
         ch = fin.read(1)
         if not ch:
             return None  # EOF before header
         if ch == b"\n":
             break
         header += ch
+        if len(header) > 64:
+            raise ValueError("invalid frame header")
     n = int(header.decode("ascii"))
     sidelog(f"_lp_read header={n}")
     if not n:
         return None
     data = bytearray()
     while len(data) < n:
-        chunk = _IO_IN.buffer.read(n - len(data))
+        _wait_for_readable(fin, deadline)
+        chunk = fin.read(n - len(data))
         sidelog(f"_lp_read payload_len={len(data)}")
         if not chunk:
             raise EOFError("stdin closed mid-frame")
@@ -128,4 +161,3 @@ def lp_write(obj):
     fout.write(str(len(b)).encode("ascii") + b"\n")
     fout.write(b)
     fout.flush()
-
