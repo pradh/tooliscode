@@ -6,6 +6,7 @@ import secrets
 import errno
 import json
 import os
+import shutil
 import stat
 import sys
 import threading
@@ -16,108 +17,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 import wasmtime  # pip install wasmtime
 
 ToolCallback = Callable[[str, str, dict[str, object]], dict[str, object]]
-
-
-_SHIM_STR = """
-# _shim.py — persistent "cell runner" inside python.wasm
-import sys, json, io, contextlib, traceback, os, time
-
-G = {"__name__": "__main__"}  # persistent globals
-
-SIDEDIR = os.path.dirname(__file__)          # <— this is the session dir
-SIDELOG = os.path.join(SIDEDIR, "_shim.log")
-
-os.chdir(SIDEDIR)
-
-def _sidelog(msg):
-    try:
-        with open(SIDELOG, "a", buffering=1) as f:  # line-buffered
-            f.write(f"[{time.time():.3f}] {msg}\\n")
-    except Exception:
-        pass
-
-_sidelog(f"shim boot: starting up {sys.stdin.isatty()} and {sys.stdin.buffer.raw}")
-
-
-def _lp_read():
-    fin = sys.stdin.buffer
-    header = bytearray()
-    while True:
-        ch = fin.read(1)
-        if not ch:
-            return None  # EOF before header
-        if ch == b"\\n":
-            break
-        header += ch
-    n = int(header.decode("ascii"))
-    _sidelog(f"_lp_read header={n}")
-    if not n:
-        return None
-    data = bytearray()
-    while len(data) < n:
-        chunk = sys.stdin.buffer.read(n - len(data))
-        _sidelog(f"_lp_read payload_len={len(data)}")
-        if not chunk:
-            raise EOFError("stdin closed mid-frame")
-        data.extend(chunk)
-    return json.loads(data)
-
-def _lp_write(obj):
-    b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    _sidelog(f"_lp_write payload_len={len(b)}")
-    fout = sys.stdout.buffer
-    fout.write(str(len(b)).encode("ascii") + b"\\n")
-    fout.write(b)
-    fout.flush()
-
-def run_cell(src: str):
-    _sidelog(f"run_cell start len={len(src)}")
-    out, err = io.StringIO(), io.StringIO()
-    ok, eobj = True, None
-    try:
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            exec(compile(src, "<cell>", "exec"), G, G)
-    except SystemExit as e:
-        ok, eobj = False, {"type": "SystemExit", "msg": str(e)}
-    except Exception as e:
-        ok, eobj = False, {"type": type(e).__name__, "msg": str(e), "trace": traceback.format_exc()}
-    _sidelog(f"run_cell done ok={ok} out={len(out.getvalue())} err={len(err.getvalue())}")
-    return {"ok": ok, "stdout": out.getvalue(), "stderr": err.getvalue(), "error": eobj}
-
-if __name__ == "__main__":
-    try:
-        while True:
-            try:
-                _sidelog("Waiting on read")
-                req = _lp_read()
-            except Exception as e:
-                _sidelog(f"_lp_read error: {type(e).__name__}: {e}")
-                _lp_write({"ok": False, "error": {"type": type(e).__name__, "msg": str(e), "trace": traceback.format_exc()}})
-                break
-            if not req:
-                _sidelog("EOF on stdin")
-                break
-            t = req.get("type")
-            _sidelog(f"recv type={t}")
-            try:
-                if t == "exec":
-                    _lp_write(run_cell(req.get("code", "")))
-                elif t == "reset":
-                    G.clear(); G["__name__"] = "__main__"
-                    _lp_write({"ok": True})
-                elif t == "exit":
-                    _lp_write({"ok": True}); break
-                else:
-                    _lp_write({"ok": False, "error": {"msg": f"unknown type: {t}"}})
-            except BrokenPipeError as e:
-                _sidelog(f"BrokenPipe during _lp_write: {e}")
-                break
-            except Exception as e:
-                _sidelog(f"_lp_write error: {type(e).__name__}: {e}")
-                break
-    finally:
-        _sidelog("main loop exit")
-"""
 
 
 def _trace(msg: str) -> None:
@@ -342,7 +241,7 @@ def _assign_fifo_path(wasi: wasmtime.WasiConfig, name: str, path: str) -> Option
 
 class _Session:
     """
-    One long-lived CPython-WASI instance running `_shim.py` inside /tmp/tooliscode/<sid>.
+    One long-lived CPython-WASI instance running `runtime.py` inside /tmp/tooliscode/<sid>.
     Maintains persistent Python globals via the shim loop.
     """
 
@@ -386,9 +285,9 @@ class _Session:
         session_alias = os.environ.get("WASI_SESSION_GUEST")
         self._session_guest_path = self._preopen_dir(wasi, self.sdir, session_alias)
 
-        self._ensure_shim_exists()
+        self._ensure_runtime_exists()
 
-        wasi.argv = ["python", "-u", f"{self._session_guest_path}/_shim.py"]
+        wasi.argv = ["python", "-u", f"{self._session_guest_path}/runtime.py"]
 
         env_map = self._setup_python_runtime(wasi, wasm_path)
         py_path = env_map.setdefault("PYTHONPATH", [])
@@ -529,11 +428,11 @@ class _Session:
             raise FileNotFoundError(f"python.wasm not found at {path}")
         return path
 
-    def _ensure_shim_exists(self) -> None:
-        shim_path = os.path.join(self.sdir, "_shim.py")
-        if not os.path.isfile(shim_path):
-            with open(shim_path, "w") as handle:
-                handle.write(_SHIM_STR)
+    def _ensure_runtime_exists(self) -> None:
+        runtime_dst_path = os.path.join(self.sdir, "runtime.py")
+        if not os.path.isfile(runtime_dst_path):
+            runtime_src_path = os.path.join(os.path.dirname(__file__), "runtime.py")
+            shutil.copyfile(runtime_src_path, runtime_dst_path)
 
     def _init_tool_channel(self) -> Tuple[str, str]:
         req_path = os.path.join(self.sdir, "tool_req.pipe")

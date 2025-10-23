@@ -16,7 +16,6 @@ class _ToolParameter:
     original_name: str
     annotation: str
     default: str | None
-    field_expr: str
     description: str | None
     optional: bool
     has_alias: bool
@@ -40,8 +39,6 @@ class ToolFunctionEmitter:
         ]
         self._session_id = session_id
         self._typing_imports: set[str] = set()
-        self._uses_field = False
-        self._uses_config_dict = False
 
     def render(self) -> str:
         if not self._tools:
@@ -58,61 +55,33 @@ class ToolFunctionEmitter:
     def _build_import_block(self) -> list[str]:
         lines = ["from __future__ import annotations"]
 
+        lines.append("import os, sys")
+        lines.append("sys.path.append(os.path.dirname(__file__))")
+        lines.append("")
+
         typing_imports = sorted(self._typing_imports)
         if typing_imports:
             lines.append(f"from typing import {', '.join(typing_imports)}")
 
-        pydantic_parts = ["BaseModel"]
-        if self._uses_config_dict:
-            pydantic_parts.append("ConfigDict")
-        if self._uses_field:
-            pydantic_parts.append("Field")
-        lines.append(f"from pydantic import {', '.join(pydantic_parts)}")
-        lines.append("from tooliscode.runtime import tool_call")
+        lines.append("from runtime import tool_call")
         return lines
 
     def _emit_tool(self, tool: dict) -> list[str]:
         name = tool.get("name") or "tool"
         fn_name = self._to_identifier(name)
-        model_name = f"{self._to_pascal_case(fn_name)}Args"
         description = tool.get("description")
         parameters_schema = tool.get("parameters") or {}
 
         parameters = self._parse_parameters(parameters_schema)
 
         lines: list[str] = []
-        lines.extend(self._emit_model(model_name, fn_name, parameters))
-        lines.append("")
-        lines.extend(self._emit_function(fn_name, name, model_name, description, parameters))
-        return lines
-
-    def _emit_model(self, model_name: str, fn_name: str, parameters: list[_ToolParameter]) -> list[str]:
-        lines = [f"class {model_name}(BaseModel):"]
-        doc = f"Pydantic model for `{fn_name}` arguments."
-        lines.extend(self._format_docstring(doc, level=1))
-
-        has_alias = any(param.has_alias for param in parameters)
-        if has_alias:
-            lines.append("    model_config = ConfigDict(populate_by_name=True)")
-            if parameters:
-                lines.append("")
-
-        if not parameters:
-            lines.append("    pass")
-            return lines
-
-        for param in parameters:
-            field_line = f"    {param.name}: {param.annotation}"
-            if param.field_expr:
-                field_line += f" = {param.field_expr}"
-            lines.append(field_line)
+        lines.extend(self._emit_function(fn_name, name, description, parameters))
         return lines
 
     def _emit_function(
         self,
         fn_name: str,
         tool_name: str,
-        model_name: str,
         description: str | None,
         parameters: list[_ToolParameter],
     ) -> list[str]:
@@ -148,10 +117,14 @@ class ToolFunctionEmitter:
         if doc_lines:
             lines.extend(self._format_docstring(doc_lines, level=1))
 
-        init_args = ", ".join(f"{param.name}={param.name}" for param in parameters)
-        lines.append(f"    args = {model_name}({init_args})" if init_args else f"    args = {model_name}()")
-        session_literal = self._repr(self._session_id)
-        lines.append(f"    return tool_call({session_literal}, {self._repr(tool_name)}, args)")
+        lines.append("    args: dict[str, Any] = {}")
+        if parameters:
+            lines.append("    for _param_name, _param_value in [")
+            for param in parameters:
+                lines.append(f"        ({self._repr(param.original_name)}, {param.name}),")
+            lines.append("    ]:")
+            lines.append("        args[_param_name] = _param_value")
+        lines.append(f'    return tool_call({self._repr(tool_name)}, args)')
         return lines
 
     def _parse_parameters(self, schema: dict) -> list[_ToolParameter]:
@@ -177,44 +150,23 @@ class ToolFunctionEmitter:
             schema_for_annotation["type"] = non_null_types[0] if non_null_types else None
         annotation = self._annotation_from_schema(schema_for_annotation)
         default_expr: str | None = None
-        field_expr: str = ""
-
         description = schema.get("description")
         default = schema.get("default")
 
-        field_kwargs: list[str] = []
-        if description:
-            field_kwargs.append(f"description={self._repr(description)}")
-
-        if is_required:
-            field_default = "..."
-        else:
+        if not is_required:
             if default is not None:
                 default_expr = self._repr(default)
-                field_default = default_expr
             else:
                 default_expr = "None"
-                field_default = "None"
-
-        needs_field = bool(field_kwargs) or not is_required or default is not None or py_name != original_name
-        if py_name != original_name:
-            field_kwargs.append(f"alias={self._repr(original_name)}")
-            needs_field = True
-            self._uses_config_dict = True
-
-        if needs_field:
-            self._uses_field = True
-            args = [field_default] if field_default not in ("...",) else ["..."]
-            args.extend(field_kwargs)
-            field_expr = f"Field({', '.join(args)})"
+        elif default is not None:
+            default_expr = self._repr(default)
 
         optional = not is_required or allows_null
         return _ToolParameter(
             name=py_name,
             original_name=original_name,
             annotation=annotation,
-            default=default_expr if default_expr != "None" or not is_required else None,
-            field_expr=field_expr,
+            default=default_expr if (default_expr is not None and (default_expr != "None" or not is_required)) else None,
             description=description,
             optional=optional,
             has_alias=py_name != original_name,
@@ -259,18 +211,6 @@ class ToolFunctionEmitter:
         if keyword.iskeyword(name):
             name = f"{name}_"
         return name
-
-    @staticmethod
-    def _to_pascal_case(name: str) -> str:
-        parts = re.split(r"[_\-\s]+", name)
-        candidate = "".join(part.capitalize() for part in parts if part)
-        if not candidate:
-            candidate = "Tool"
-        if candidate[0].isdigit():
-            candidate = f"Tool{candidate}"
-        if keyword.iskeyword(candidate.lower()):
-            candidate = f"{candidate}Model"
-        return candidate
 
     @staticmethod
     def _format_docstring(text: str | list[str], level: int = 0) -> list[str]:

@@ -81,7 +81,7 @@ class ToolIsCode:
         code = func_call.get("arguments").get("code")
         if code:
             result = wasi_service.exec_cell(self._sid, code)
-            output = result.stdout if result.ok else result.stderr
+            output = result.stdout if result.ok else result.error
         else:
             output = ""
         return {
