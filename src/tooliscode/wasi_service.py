@@ -1,6 +1,8 @@
 # wasi_server.py
 from __future__ import annotations
 
+import base64
+import secrets
 import errno
 import json
 import os
@@ -9,9 +11,11 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 
 import wasmtime  # pip install wasmtime
+
+ToolCallback = Callable[[str, str, dict[str, object]], dict[str, object]]
 
 
 _SHIM_STR = """
@@ -220,6 +224,87 @@ class _FifoReader:
         os.close(self._fd)
 
 
+class _ToolRequestWorker:
+    def __init__(self, sid: str, callback: ToolCallback, req_path: str, resp_path: str) -> None:
+        self._sid = sid
+        self._callback = callback
+        self._req_path = req_path
+        self._resp_path = resp_path
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"tooliscode-host-{sid}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        try:
+            with open(self._req_path, "w", encoding="utf-8", buffering=1) as pipe:
+                pipe.write("\n")
+                pipe.flush()
+        except OSError:
+            pass
+        self._thread.join(timeout=1)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                with open(self._req_path, "r", encoding="utf-8", buffering=1) as req_fh:
+                    for line in req_fh:
+                        if self._stop_event.is_set():
+                            return
+                        payload = line.strip()
+                        if not payload:
+                            continue
+                        try:
+                            message = json.loads(payload)
+                        except json.JSONDecodeError:
+                            _trace(f"[session {self._sid}] invalid tool request json")
+                            continue
+                        self._handle_request(message)
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                if self._stop_event.is_set():
+                    return
+                _trace(f"[session {self._sid}] tool request read error: {exc}")
+                time.sleep(0.1)
+
+    def _handle_request(self, message: dict) -> None:
+        request_id = message.get("id")
+        if not request_id:
+            return
+        name = message.get("name") or ""
+        arguments = message.get("arguments") or {}
+        try:
+            result = self._callback(name, request_id, arguments)
+        except Exception as exc:  # pragma: no cover - defensive
+            _trace(f"[session {self._sid}] tool callback error: {exc}")
+            response = {
+                    "type": "tool_result",
+                    "id": request_id,
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+            }
+        else:
+            assert isinstance(result, dict)
+            response = result.copy()
+            response.setdefault("type", "tool_result")
+            response.setdefault("id", request_id)
+
+        try:
+            with open(self._resp_path, "w", encoding="utf-8", buffering=1) as resp_fh:
+                resp_fh.write(json.dumps(response, ensure_ascii=False))
+                resp_fh.write("\n")
+                resp_fh.flush()
+        except OSError as exc:
+            _trace(f"[session {self._sid}] tool response write error: {exc}")
+
+
 @dataclass
 class ExecResult:
     ok: bool
@@ -261,8 +346,9 @@ class _Session:
     Maintains persistent Python globals via the shim loop.
     """
 
-    def __init__(self, sid: str, root: str = "/tmp/tooliscode") -> None:
+    def __init__(self, sid: str, callback: ToolCallback, root: str = "/tmp/tooliscode") -> None:
         self.sid = sid
+        self.callback = callback
         self.sdir = os.path.abspath(os.path.join(root, sid))
         _trace(f"[session {sid}] init start (root={self.sdir})")
         if not os.path.isdir(self.sdir):
@@ -318,6 +404,8 @@ class _Session:
         self._fifo_paths: Optional[Dict[str, str]] = None
         self._fifo_placeholders: Dict[str, int] = {}
         self._use_pipe = hasattr(wasmtime, "Pipe")
+        self._tool_worker: Optional[_ToolRequestWorker] = None
+        self._tool_req_path, self._tool_resp_path = self._init_tool_channel()
 
         if self._use_pipe:
             _trace(f"[session {sid}] using wasmtime.Pipe for stdio")
@@ -359,6 +447,7 @@ class _Session:
         self._guest_thread.start()
 
         self._lock = threading.Lock()
+        self._tool_worker = _ToolRequestWorker(self.sid, self.callback, self._tool_req_path, self._tool_resp_path)
         _trace(f"[session {sid}] init complete")
 
     def exec_cell(self, code: str, timeout_ms: int = 8000) -> ExecResult:
@@ -445,6 +534,22 @@ class _Session:
         if not os.path.isfile(shim_path):
             with open(shim_path, "w") as handle:
                 handle.write(_SHIM_STR)
+
+    def _init_tool_channel(self) -> Tuple[str, str]:
+        req_path = os.path.join(self.sdir, "tool_req.pipe")
+        resp_path = os.path.join(self.sdir, "tool_res.pipe")
+        for path in (req_path, resp_path):
+            if os.path.exists(path):
+                try:
+                    mode = os.stat(path).st_mode
+                except OSError:
+                    mode = None
+                if not mode or not stat.S_ISFIFO(mode):
+                    os.unlink(path)
+                    os.mkfifo(path, 0o600)
+            else:
+                os.mkfifo(path, 0o600)
+        return req_path, resp_path
 
     def _prepare_fifos(self) -> Dict[str, str]:
         mapping = {
@@ -597,6 +702,9 @@ class _Session:
         return alias
 
     def _cleanup_stdio(self) -> None:
+        if self._tool_worker is not None:
+            self._tool_worker.stop()
+            self._tool_worker = None
         for stream in (self._stdin, self._stdout, self._stderr):
             if stream is None:
                 continue
@@ -613,6 +721,13 @@ class _Session:
                 except FileNotFoundError:
                     pass
         self._release_fifo_placeholders()
+        for path in (self._tool_req_path, self._tool_resp_path):
+            if not path:
+                continue
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
 
 class WasiService:
@@ -626,17 +741,16 @@ class WasiService:
         self._sessions: Dict[str, _Session] = {}
         self._lock = threading.RLock()
 
-    def ensure_session(self, sid: str) -> None:
+    def create_session(self, callback: ToolCallback) -> str:
+        sid = base64.b64encode(secrets.token_bytes(12)).decode("ascii")
+        _trace(f"[server] creating session {sid}")
+        assert sid not in self._sessions
         with self._lock:
-            if sid not in self._sessions:
-                _trace(f"[server] creating session {sid}")
-                self._sessions[sid] = _Session(sid, self.root)
-            else:
-                _trace(f"[server] session {sid} already exists")
+            self._sessions[sid] = _Session(sid, self.root, callback)
+        return sid
 
     def exec_cell(self, sid: str, code: str, timeout_ms: int = 8000) -> ExecResult:
         _trace(f"[server] exec_cell sid={sid}")
-        self.ensure_session(sid)
         return self._sessions[sid].exec_cell(code, timeout_ms=timeout_ms)
 
     def reset(self, sid: str) -> None:

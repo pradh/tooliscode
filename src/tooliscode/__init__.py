@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import base64
-import secrets
 from importlib import metadata
+from typing import Callable, Optional, Any
 
 from .functions import ToolFunctionEmitter
+from .wasi_service import ToolCallback, WasiService
 
 try:  # pragma: no cover - optional dependency
     from openai import OpenAI  # type: ignore
@@ -44,11 +44,20 @@ _DEFAULT_CODE_TOOL = {
     },
 }
 
+wasi_service: WasiService | None = None
 
 class ToolIsCode:
-    def __init__(self, tools: list[dict]):
+    def __init__(
+        self,
+        tools: list[dict],
+        callback: Optional[ToolCallback] = None,
+    ) -> None:
+        global wasi_service
+        if wasi_service is None:
+            wasi_service = WasiService()
+
         self._orig_tools = tools
-        self._sid = base64.b64encode(secrets.token_bytes(12)).decode("ascii")
+        self._sid = wasi_service.create_session(callback)
         self._tool_source = ToolFunctionEmitter(self._sid, self._orig_tools).render()
 
     def tools(self) -> str:
@@ -61,3 +70,18 @@ class ToolIsCode:
             f"those functions can be large in size.  So you should write to a file within {_BASE_PATH}/{self._sid} and " +
             "selectively open it, to avoid blowing through your context window."
         )
+    
+    def tool_call(self, func_call: dict[str, Any]) -> str:
+        assert func_call.get("type") == "function_call"
+        assert func_call.get("name") == "python"
+        code = func_call.get("arguments").get("code")
+        if code:
+            result = wasi_service.exec_cell(self._sid, code)
+            output = result.stdout if result.ok else result.stderr
+        else:
+            output = ""
+        return {
+            "type": "function_call_output",
+            "call_id": func_call.get("call_id"),
+            "output": output
+        }

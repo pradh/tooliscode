@@ -6,7 +6,6 @@ import keyword
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable
-from . import Context
 
 __all__ = ["ToolFunctionEmitter"]
 

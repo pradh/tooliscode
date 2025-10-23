@@ -14,8 +14,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.append(str(SRC))
 
-from tooliscode import runtime as runtime_mod
+from tooliscode import ToolIsCode, get_tool_callback, runtime as runtime_mod, set_tool_callback
 from tooliscode.runtime import ToolCallError, tool_call
+from tooliscode.wasi_service import _ToolRequestWorker
 
 
 class EchoArgs(BaseModel):
@@ -68,3 +69,59 @@ def test_tool_call_missing_environment(tmp_path, monkeypatch):
 
     with pytest.raises(ToolCallError):
         tool_call("noop", EchoArgs(text="hi"), timeout=0.1)
+
+
+def test_tool_request_worker_dispatch(tmp_path):
+    req_pipe = tmp_path / "tool_req.pipe"
+    resp_pipe = tmp_path / "tool_res.pipe"
+    os.mkfifo(req_pipe)
+    os.mkfifo(resp_pipe)
+
+    responses = {}
+
+    def callback(name: str, request_id: str, arguments: dict[str, object]) -> dict[str, object]:
+        responses[request_id] = {"name": name, "arguments": arguments}
+        return {
+            "type": "tool_result",
+            "id": request_id,
+            "content": {"ok": True, "args": arguments},
+        }
+
+    ToolIsCode([], callback=callback)
+
+    worker = _ToolRequestWorker("alpha", callback, str(req_pipe), str(resp_pipe))
+
+    received: dict[str, object] = {}
+
+    def reader() -> None:
+        with open(resp_pipe, "r", encoding="utf-8", buffering=1) as resp_fh:
+            payload = resp_fh.readline().strip()
+            if payload:
+                received.update(json.loads(payload))
+
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
+
+    message = {
+        "type": "function_call",
+        "id": "req-1",
+        "name": "echo",
+        "arguments": {"text": "hi"},
+    }
+    with open(req_pipe, "w", encoding="utf-8", buffering=1) as req_fh:
+        req_fh.write(json.dumps(message))
+        req_fh.write("\n")
+        req_fh.flush()
+
+    reader_thread.join(timeout=1)
+    worker.stop()
+
+    assert "req-1" in responses
+    assert responses["req-1"]["name"] == "echo"
+    assert responses["req-1"]["arguments"] == {"text": "hi"}
+    assert received["type"] == "tool_result"
+    assert received["id"] == "req-1"
+    assert received["content"] == {"ok": True, "args": {"text": "hi"}}
+
+    # Clean up callback for subsequent tests
+    set_tool_callback(previous_callback)
