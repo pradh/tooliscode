@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from importlib import metadata
-from typing import Callable, Optional, Any
+from typing import Optional, Any
 
 from .functions import ToolFunctionEmitter
 from .wasi_service import ToolCallback, WasiService
@@ -44,7 +44,8 @@ _DEFAULT_CODE_TOOL = {
     },
 }
 
-NOP_CALLBACK: Callable[[str, str, dict[str, object]], dict[str, object]] = lambda x, y, z: {}
+def NOP_CALLBACK(x: str, y: str, z: dict[str, object]) -> dict[str, object]:
+    return {}
 
 
 wasi_service: WasiService | None = None
@@ -91,3 +92,6 @@ class ToolIsCode:
 
     def session_id(self) -> str:
         return self._sid
+    
+    def sdk_code(self) -> str:
+        return self._tool_source

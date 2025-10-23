@@ -1,13 +1,19 @@
-"""Example driver for :class:`tooliscode.ToolIsCode`."""
+"""Example driver for :class:`tooliscode.ToolIsCode`.
+
+This script wires up a simple callback that returns mock weather data, writes the
+generated ``sdk.py`` into the active ToolIsCode session directory, and executes a
+short Python snippet inside the WASI runtime to demonstrate the end-to-end
+`tool_call` flow.
+"""
 
 from __future__ import annotations
 
 import json
-import os
 import textwrap
-from typing import Any
+from pathlib import Path
+from typing import Any, Dict
 
-from tooliscode import ToolIsCode
+from tooliscode import ToolIsCode, _BASE_PATH, wasi_service
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -33,10 +39,47 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
+def weather_callback(name: str, request_id: str, arguments: Dict[str, object]) -> Dict[str, object]:
+    """Respond to tool requests issued by the WASI guest."""
+    print("GOT weather_callback")
+    if name != "get_weather":
+        return {
+            "type": "tool_result",
+            "id": request_id,
+            "error": {
+                "type": "UnknownTool",
+                "message": f"Unhandled tool name: {name}",
+            },
+        }
+
+    city = str(arguments.get("city", "Unknown City"))
+    units = str(arguments.get("units", "metric"))
+    mock_result = {
+        "city": city,
+        "units": units,
+        "temperature": 21 if units == "metric" else 70,
+        "conditions": "partly cloudy",
+    }
+    return {
+        "type": "tool_result",
+        "id": request_id,
+        "content": mock_result,
+    }
+
+
+def _write_sdk(session_id: str, source: str) -> Path:
+    """Persist the generated sdk.py so the guest can import it."""
+    session_dir = Path(_BASE_PATH) / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    sdk_path = session_dir / "sdk.py"
+    sdk_path.write_text(source, encoding="utf-8")
+    return sdk_path
+
+
 def main() -> None:
     # ``ToolIsCode`` depends on python.wasm. Surface a friendly error if it is missing.
     try:
-        client = ToolIsCode(TOOLS)
+        client = ToolIsCode(TOOLS, callback=weather_callback)
     except FileNotFoundError as exc:
         print("Unable to initialise ToolIsCode:", exc)
         print("Set the PYTHON_WASM environment variable to the wasm build of CPython.")
@@ -49,6 +92,39 @@ def main() -> None:
     print("\nTools advertised to the model:")
     print(textwrap.indent(json.dumps(client.tools(), indent=2), "  "))
 
+    print("\nGenerated sdk.py contents:")
+    print(textwrap.indent(client.sdk_code(), "  "))
+
+    sdk_path = _write_sdk(client.session_id(), client.sdk_code())
+    print(f"\nWrote sdk to {sdk_path}")
+
+    code = textwrap.dedent(
+        """
+        import json
+        from sdk import get_weather
+
+        result = get_weather(city="Paris", units="metric")
+        print(json.dumps(result))
+        """
+    ).strip()
+
+    print("\nRunning tool_call through WASI runtime...")
+    try:
+        response = client.tool_call(
+            {
+                "type": "function_call",
+                "name": "python",
+                "call_id": "demo-call-1",
+                "arguments": {"code": code},
+            }
+        )
+    except Exception as exc:  # pragma: no cover - demo script
+        print("tool_call failed:", exc)
+    else:
+        print(textwrap.indent(json.dumps(response, indent=2), "  "))
+    finally:
+        if wasi_service is not None:
+            wasi_service.close(client.session_id())
 
 
 if __name__ == "__main__":

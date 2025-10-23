@@ -58,7 +58,7 @@ def main() -> None:
 
         _print_result(
             "alpha: file",
-            service.exec_cell(alpha, f'open("alpha.txt","w").write("hello alpha"); print("ok")')
+            service.exec_cell(alpha, 'open("alpha.txt","w").write("hello alpha"); print("ok")')
         )
 
         _print_result(

@@ -9,14 +9,14 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
+from tooliscode import runtime as runtime_mod
+from tooliscode.runtime import ToolCallError, tool_call
+from tooliscode.wasi_service import _ToolRequestWorker
+
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.append(str(SRC))
-
-from tooliscode import runtime as runtime_mod
-from tooliscode.runtime import ToolCallError, tool_call
-from tooliscode.wasi_service import _ToolRequestWorker
 
 
 class EchoArgs(BaseModel):
@@ -29,9 +29,7 @@ def test_tool_call_round_trip(tmp_path, monkeypatch):
     os.mkfifo(req_pipe)
     os.mkfifo(resp_pipe)
 
-    monkeypatch.setenv("TOOLISCODE_SESSION_DIR", str(tmp_path))
-    monkeypatch.delenv("TOOLISCODE_TOOL_REQ", raising=False)
-    monkeypatch.delenv("TOOLISCODE_TOOL_RES", raising=False)
+    monkeypatch.chdir(tmp_path)
 
     ack = threading.Event()
 
@@ -63,12 +61,11 @@ def test_tool_call_round_trip(tmp_path, monkeypatch):
 
 
 def test_tool_call_missing_environment(tmp_path, monkeypatch):
-    monkeypatch.delenv("TOOLISCODE_SESSION_DIR", raising=False)
-    monkeypatch.delenv("TOOLISCODE_TOOL_REQ", raising=False)
-    monkeypatch.delenv("TOOLISCODE_TOOL_RES", raising=False)
+    monkeypatch.chdir(tmp_path)
 
     with pytest.raises(ToolCallError):
         tool_call("alpha", "noop", EchoArgs(text="hi"), timeout=0.1)
+    runtime_mod._session_runtimes.clear()
 
 
 def test_tool_request_worker_dispatch(tmp_path):
