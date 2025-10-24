@@ -30,6 +30,7 @@ response = openai.responses.create(
     tools=tic.tools,
     # -> Pass in (or append) instructions
     instructions=tic.instructions,   
+    ...
 )
 
 # -> If there is a function_call item, call tool_call
