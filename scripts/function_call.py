@@ -12,6 +12,7 @@ client = OpenAI()
 
 def callback(req_id: str, function_name: str, args: str) -> dict[str, Any]:
     print(f"function_call: {req_id=} {function_name=} {args=}")
+    assert function_name == "get_current_weather"
     return "Weather is 22 'c."
 
 
@@ -35,8 +36,6 @@ tic_client = ToolIsCode(
     ],
     callback=callback,
 )
-
-print(tic_client.tools)
 
 response = client.responses.create(
     model="gpt-5-mini",

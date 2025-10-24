@@ -10,16 +10,6 @@ from .host import ToolCallback, WasiService
 
 import json
 
-try:  # pragma: no cover - optional dependency
-    from openai import OpenAI  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    class OpenAI:  # type: ignore[no-redef]
-        def __init__(self, *args, **kwargs) -> None:
-            raise ModuleNotFoundError(
-                "openai package not installed; run `pip install tooliscode[dev]` "
-                "or provide a stub before using tooliscode.Client."
-            )
-
 __all__ = ["__version__", "ToolIsCode"]
 
 try:
@@ -29,7 +19,6 @@ except metadata.PackageNotFoundError:  # pragma: no cover - package not installe
 
 
 _BASE_PATH = "/tmp/tooliscode"
-_SDK_FILE = 'sdk.py'
 
 _DEFAULT_CODE_TOOL = {
     "type": "function",

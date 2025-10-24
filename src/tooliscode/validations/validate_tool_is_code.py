@@ -18,22 +18,20 @@ from tooliscode import ToolIsCode, _BASE_PATH, wasi_service
 TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Fetch weather information for a city.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string", "description": "City name"},
-                    "units": {
-                        "type": "string",
-                        "enum": ["metric", "imperial"],
-                        "description": "Unit system",
-                        "default": "metric",
-                    },
+        "name": "get_weather",
+        "description": "Fetch weather information for a city.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "City name"},
+                "units": {
+                    "type": "string",
+                    "enum": ["metric", "imperial"],
+                    "description": "Unit system",
+                    "default": "metric",
                 },
-                "required": ["city"],
             },
+            "required": ["city"],
         },
     }
 ]
@@ -60,8 +58,6 @@ def weather_callback(name: str, request_id: str, arguments: Dict[str, object]) -
         "conditions": "partly cloudy",
     }
     return {
-        "type": "tool_result",
-        "id": request_id,
         "content": mock_result,
     }
 
@@ -72,7 +68,7 @@ def main() -> None:
         client = ToolIsCode(TOOLS, callback=weather_callback)
     except FileNotFoundError as exc:
         print("Unable to initialise ToolIsCode:", exc)
-        print("Set the PYTHON_WASM environment variable to the wasm build of CPython.")
+        print("Set the PYTHON_WASM_HOME environment variable to the wasm build of CPython.")
         return
 
     print(f"Session id: {client.session_id}")
@@ -111,7 +107,7 @@ def main() -> None:
         print(textwrap.indent(json.dumps(response, indent=2), "  "))
     finally:
         if wasi_service is not None:
-            wasi_service.close(client.session_id())
+            wasi_service.close(client.session_id)
 
 
 if __name__ == "__main__":

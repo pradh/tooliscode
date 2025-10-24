@@ -9,7 +9,7 @@ from tooliscode import NOP_CALLBACK
 from tooliscode.host import ExecResult, WasiService
 
 ROOT = Path(os.environ.get("TOOLISCODE_ROOT", "/tmp/tooliscode")).resolve()
-PYTHON_WASM = os.environ.get("PYTHON_WASM", "/opt/wasm/python.wasm")
+PYTHON_WASM_HOME = os.environ.get("PYTHON_WASM_HOME", "/opt/wasm")
 
 
 def _print_result(label: str, result: ExecResult) -> None:
@@ -28,7 +28,7 @@ def _print_result(label: str, result: ExecResult) -> None:
 
 def main() -> None:
     # Ensure the python.wasm path is available to the guest.
-    os.environ.setdefault("PYTHON_WASM", PYTHON_WASM)
+    os.environ.setdefault("PYTHON_WASM_HOME", PYTHON_WASM_HOME)
 
     service = WasiService(root=str(ROOT))
     sessions: list[str] = []

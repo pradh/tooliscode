@@ -384,7 +384,7 @@ class _Session:
                 self._cleanup_stdio()
 
     def _python_wasm_path(self) -> str:
-        path = os.environ.get("PYTHON_WASM", "/opt/wasm/python.wasm")
+        path = os.path.join(os.environ.get("PYTHON_WASM_HOME", "/opt/wasm"), "python.wasm")
         if not os.path.isfile(path):
             raise FileNotFoundError(f"python.wasm not found at {path}")
         return path

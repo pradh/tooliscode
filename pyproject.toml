@@ -27,6 +27,7 @@ dependencies = ["openai", "pydantic>=2.0", "wasmtime"]
 dev = [
   "pytest>=8.0",
   "ruff>=0.5.0",
+  "wasmtime",
 ]
 
 [project.urls]
