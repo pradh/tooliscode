@@ -164,7 +164,7 @@ class _Session:
     Maintains persistent Python globals via the shim loop.
     """
 
-    def __init__(self, sid: str, callback: ToolCallback, root: str = "/tmp/tooliscode") -> None:
+    def __init__(self, sid: str, callback: ToolCallback, tool_code: str, root: str = "/tmp/tooliscode") -> None:
         self.sid = sid
         self.callback = callback
         self.sdir = os.path.abspath(os.path.join(root, sid))
@@ -204,7 +204,7 @@ class _Session:
         session_alias = os.environ.get("WASI_SESSION_GUEST")
         self._session_guest_path = self._preopen_dir(wasi, self.sdir, session_alias)
 
-        self._ensure_guest_files()
+        self._ensure_guest_files(tool_code)
 
         wasi.argv = ["python", "-u", f"{self._session_guest_path}/guest.py"]
 
@@ -307,7 +307,8 @@ class _Session:
                 f"[session {self.sid}] exec done ok={resp.get('ok')} wall={wall}ms "
                 f"stdout_len={len(resp.get('stdout') or '')} stderr_len={len(stderr)}"
             )
-            _trace(resp)
+            if resp.get("error"):
+                _trace(resp.get("error").get("trace"))
 
             return ExecResult(
                 ok=bool(resp.get("ok")),
@@ -324,6 +325,7 @@ class _Session:
                 continue
             msg_type = resp.get("type")
             if msg_type == "tool_request":
+                _trace(f"[session {self.sid}] got tool_request")
                 self._handle_tool_request(resp)
                 continue
             if msg_type is None:
@@ -338,7 +340,7 @@ class _Session:
         name = message.get("name") or ""
         arguments = message.get("arguments") or {}
         try:
-            result = self.callback(name, request_id, arguments)
+            result = self.callback(request_id, name, arguments)
         except Exception as exc:  # pragma: no cover - defensive
             _trace(f"[session {self.sid}] tool callback error: {exc}")
             response = {
@@ -350,11 +352,13 @@ class _Session:
                 },
             }
         else:
-            assert isinstance(result, dict)
-            response = result.copy()
-            response.setdefault("type", "tool_result")
-            response.setdefault("id", request_id)
+            response = {
+                "type": "tool_result",
+                "id": request_id,
+                "content": result,
+            }
 
+        _trace(f"[session {self.sid}] sending tool_result")
         _lp_write(self._stdin, response)
 
     def reset(self) -> None:
@@ -385,12 +389,16 @@ class _Session:
             raise FileNotFoundError(f"python.wasm not found at {path}")
         return path
 
-    def _ensure_guest_files(self) -> None:
+    def _ensure_guest_files(self, tool_code: str) -> None:
         for f in ["guest.py", "guest_helpers.py"]:
             dst_path = os.path.join(self.sdir, f)
             if not os.path.isfile(dst_path):
                 src_path = os.path.join(os.path.dirname(__file__), f)
                 shutil.copyfile(src_path, dst_path)
+        
+        with open(os.path.join(self.sdir, "sdk.py"), "w") as f:
+            f.write(tool_code)
+            f.write("\n")
 
     def _prepare_fifos(self) -> Dict[str, str]:
         mapping = {
@@ -573,14 +581,14 @@ class WasiService:
         self._lock = threading.RLock()
         os.makedirs(self.root, exist_ok=True)
 
-    def create_session(self, callback: ToolCallback) -> str:
-        sid = base64.b64encode(secrets.token_bytes(12)).decode("ascii")
+    def create_session(self, callback: ToolCallback, tool_code: str) -> str:
+        sid = base64.b64encode(secrets.token_bytes(12)).decode("ascii").replace('/', '-')
         _trace(f"[server] creating session {sid}")
         assert sid not in self._sessions
         with self._lock:
             session_dir = os.path.join(self.root, sid)
             os.makedirs(session_dir, exist_ok=True)
-            self._sessions[sid] = _Session(sid, callback, self.root)
+            self._sessions[sid] = _Session(sid, callback, tool_code, self.root)
         return sid
 
     def exec_cell(self, sid: str, code: str, timeout_ms: int = 8000) -> ExecResult:

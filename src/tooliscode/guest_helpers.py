@@ -72,7 +72,9 @@ class ToolRuntime:
             "arguments": args,
         }
         with _IO_LOCK:
+            sidelog(f"sending tool_request {function_name=} {request_id=}")
             lp_write(payload)
+            sidelog(f"awaiting tool_result {function_name=} {request_id=}")
             return self._await_response(request_id, timeout)
 
     def _await_response(self, request_id: str, timeout: float) -> dict[str, Any]:
@@ -90,13 +92,16 @@ class ToolRuntime:
             except TimeoutError as exc:
                 raise ToolCallError("Timed out waiting for tool result") from exc
             if not isinstance(message, dict):
+                sidelog(f"Error: got non-dict message")
                 continue
             if not message:
+                sidelog(f"Error: got empty message")
                 continue
             if message.get("type") != "tool_result":
                 raise ToolCallError(f"Unexpected message while waiting for tool result: {message!r}")
             if message.get("id") != request_id:
                 raise ToolCallError(f"Mismatched tool result id: expected {request_id}, got {message.get('id')}")
+            sidelog(f"got tool_result {request_id=}") 
             return message
 
     def shutdown(self) -> None:
@@ -129,6 +134,7 @@ def lp_read(timeout: float | None = None):
     fin = _IO_IN.buffer
     deadline = time.monotonic() + timeout if timeout is not None else None
     header = bytearray()
+    sidelog(f"lp_read with {deadline}")
     while True:
         _wait_for_readable(fin, deadline)
         ch = fin.read(1)

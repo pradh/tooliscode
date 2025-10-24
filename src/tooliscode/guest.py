@@ -23,6 +23,8 @@ def run_cell(src: str):
     except Exception as e:
         ok, eobj = False, {"type": type(e).__name__, "msg": str(e), "trace": traceback.format_exc()}
     sidelog(f"run_cell done ok={ok} out={len(out.getvalue())} err={len(err.getvalue())}")
+    if not ok:
+        sidelog(eobj)
     return {"ok": ok, "stdout": out.getvalue(), "stderr": err.getvalue(), "error": eobj}
 
 

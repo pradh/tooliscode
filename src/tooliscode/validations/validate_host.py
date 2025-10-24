@@ -33,8 +33,8 @@ def main() -> None:
     service = WasiService(root=str(ROOT))
     sessions: list[str] = []
     try:
-        alpha = service.create_session(NOP_CALLBACK)
-        beta = service.create_session(NOP_CALLBACK)
+        alpha = service.create_session(NOP_CALLBACK, "")
+        beta = service.create_session(NOP_CALLBACK, "")
         sessions.extend([alpha, beta])
         print(f"Created sessions alpha={alpha} beta={beta}")
 

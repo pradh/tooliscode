@@ -7,9 +7,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-__all__ = ["ToolFunctionEmitter"]
-
-
 @dataclass
 class _ToolParameter:
     name: str
@@ -31,13 +28,12 @@ class ToolFunctionEmitter:
         "boolean": "bool",
     }
 
-    def __init__(self, session_id: str, tools: Iterable[dict]):
+    def __init__(self, tools: Iterable[dict]):
         self._tools = [
-            tool["function"]
+            tool
             for tool in tools
-            if isinstance(tool, dict) and tool.get("type") == "function" and "function" in tool
+            if isinstance(tool, dict) and tool.get("type") == "function"
         ]
-        self._session_id = session_id
         self._typing_imports: set[str] = set()
 
     def render(self) -> str:
@@ -56,7 +52,7 @@ class ToolFunctionEmitter:
         lines = ["from __future__ import annotations"]
 
         lines.append("import os, sys")
-        lines.append("sys.path.append(os.path.dirname(__file__))")
+        lines.append("sys.path.append(os.path.dirname(os.path.dirname(__file__)))")
         lines.append("")
 
         typing_imports = sorted(self._typing_imports)

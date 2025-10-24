@@ -41,7 +41,6 @@ TOOLS: list[dict[str, Any]] = [
 
 def weather_callback(name: str, request_id: str, arguments: Dict[str, object]) -> Dict[str, object]:
     """Respond to tool requests issued by the WASI guest."""
-    print("GOT weather_callback")
     if name != "get_weather":
         return {
             "type": "tool_result",
@@ -67,15 +66,6 @@ def weather_callback(name: str, request_id: str, arguments: Dict[str, object]) -
     }
 
 
-def _write_sdk(session_id: str, source: str) -> Path:
-    """Persist the generated sdk.py so the guest can import it."""
-    session_dir = Path(_BASE_PATH) / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
-    sdk_path = session_dir / "sdk.py"
-    sdk_path.write_text(source, encoding="utf-8")
-    return sdk_path
-
-
 def main() -> None:
     # ``ToolIsCode`` depends on python.wasm. Surface a friendly error if it is missing.
     try:
@@ -85,18 +75,15 @@ def main() -> None:
         print("Set the PYTHON_WASM environment variable to the wasm build of CPython.")
         return
 
-    print(f"Session id: {client.session_id()}")
+    print(f"Session id: {client.session_id}")
     print("\nInstructions for operators:")
-    print(textwrap.indent(client.instructions(), "  "))
+    print(textwrap.indent(client.instructions, "  "))
 
     print("\nTools advertised to the model:")
-    print(textwrap.indent(json.dumps(client.tools(), indent=2), "  "))
+    print(textwrap.indent(json.dumps(client.tools, indent=2), "  "))
 
     print("\nGenerated sdk.py contents:")
-    print(textwrap.indent(client.sdk_code(), "  "))
-
-    sdk_path = _write_sdk(client.session_id(), client.sdk_code())
-    print(f"\nWrote sdk to {sdk_path}")
+    print(textwrap.indent(client.sdk_code, "  "))
 
     code = textwrap.dedent(
         """
@@ -115,7 +102,7 @@ def main() -> None:
                 "type": "function_call",
                 "name": "python",
                 "call_id": "demo-call-1",
-                "arguments": {"code": code},
+                "arguments": json.dumps({"code": code})
             }
         )
     except Exception as exc:  # pragma: no cover - demo script
