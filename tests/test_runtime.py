@@ -8,6 +8,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+import tempfile
 
 import pytest
 
@@ -16,6 +17,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.append(str(SRC))
 
+import tooliscode.guest_helpers as guest_helpers
 from tooliscode.guest_helpers import ToolCallError, tool_call, ToolRuntime
 from tooliscode.host import _Session
 
@@ -55,12 +57,12 @@ def _redirect_guest_io() -> Iterator[tuple[io.BufferedWriter, io.BufferedReader]
     stdin_r, stdin_w = os.pipe()
     stdout_r, stdout_w = os.pipe()
 
-    guest_stdin = io.BufferedReader(os.fdopen(stdin_r, "rb", buffering=0))
-    guest_stdout = io.BufferedWriter(os.fdopen(stdout_w, "wb", buffering=0))
+    guest_stdin_raw = os.fdopen(stdin_r, "rb", buffering=0)
+    guest_stdout_raw = os.fdopen(stdout_w, "wb", buffering=0)
 
     class _FakeStdin:
-        def __init__(self, buffer: io.BufferedReader) -> None:
-            self.buffer = buffer
+        def __init__(self, raw: io.BufferedReader) -> None:
+            self.buffer = raw
 
         def read(self, n: int = -1) -> str:
             data = self.buffer.read(n)
@@ -71,10 +73,7 @@ def _redirect_guest_io() -> Iterator[tuple[io.BufferedWriter, io.BufferedReader]
             return data.decode("utf-8") if data else ""
 
         def fileno(self) -> int:
-            raw = getattr(self.buffer, "raw", None)
-            if raw is not None and hasattr(raw, "fileno"):
-                return raw.fileno()
-            return 0
+            return self.buffer.fileno()
 
         def isatty(self) -> bool:
             return False
@@ -83,8 +82,8 @@ def _redirect_guest_io() -> Iterator[tuple[io.BufferedWriter, io.BufferedReader]
             self.buffer.close()
 
     class _FakeStdout:
-        def __init__(self, buffer: io.BufferedWriter) -> None:
-            self.buffer = buffer
+        def __init__(self, raw: io.BufferedWriter) -> None:
+            self.buffer = raw
 
         def write(self, data: str) -> int:
             encoded = data.encode("utf-8")
@@ -101,9 +100,15 @@ def _redirect_guest_io() -> Iterator[tuple[io.BufferedWriter, io.BufferedReader]
         def close(self) -> None:
             self.buffer.close()
 
-    sys.stdin = _FakeStdin(guest_stdin)
-    sys.stdout = _FakeStdout(guest_stdout)
+    sys.stdin = _FakeStdin(guest_stdin_raw)
+    sys.stdout = _FakeStdout(guest_stdout_raw)
     ToolRuntime._instance = None
+    guest_helpers._IO_IN = sys.stdin
+    guest_helpers._IO_OUT = sys.stdout
+    original_log = guest_helpers.SIDELOG
+    tmp_log = Path(tempfile.gettempdir()) / f"tooliscode-runtime-{os.getpid()}.log"
+    guest_helpers.SIDELOG = str(tmp_log)
+    Path(original_log).unlink(missing_ok=True)
 
     host_stdin = os.fdopen(stdin_w, "wb", buffering=0)
     host_stdout = os.fdopen(stdout_r, "rb", buffering=0)
@@ -111,12 +116,19 @@ def _redirect_guest_io() -> Iterator[tuple[io.BufferedWriter, io.BufferedReader]
     try:
         yield host_stdin, host_stdout
     finally:
+        guest_helpers.SIDELOG = original_log
         sys.stdin.close()
         sys.stdout.close()
         host_stdin.close()
         host_stdout.close()
         sys.stdin = orig_stdin
         sys.stdout = orig_stdout
+        guest_helpers._IO_IN = sys.stdin
+        guest_helpers._IO_OUT = sys.stdout
+        try:
+            Path(tmp_log).unlink()
+        except FileNotFoundError:
+            pass
         ToolRuntime._instance = None
 
 
@@ -153,7 +165,7 @@ def test_tool_call_timeout():
 
 
 def test_session_handle_tool_request():
-    responses: list[dict[str, object]] = []
+    responses: list[tuple[str, str, dict[str, object]]] = []
 
     class Buffer(io.BytesIO):
         def write(self, data: bytes) -> int:
@@ -164,9 +176,9 @@ def test_session_handle_tool_request():
 
     stdin_buffer = Buffer()
 
-    def callback(name: str, request_id: str, arguments: dict[str, object]) -> dict[str, object]:
-        responses.append({"name": name, "arguments": arguments})
-        return {"id": request_id, "type": "tool_result", "content": {"ok": True}}
+    def callback(request_id: str, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        responses.append((request_id, name, arguments))
+        return {"ok": True}
 
     session = _Session.__new__(_Session)  # type: ignore[misc]
     session.sid = "alpha"  # type: ignore[attr-defined]
@@ -182,4 +194,4 @@ def test_session_handle_tool_request():
     assert payload["type"] == "tool_result"
     assert payload["id"] == "abc"
     assert payload["content"] == {"ok": True}
-    assert responses == [{"name": "echo", "arguments": {"text": "hi"}}]
+    assert responses == [("abc", "echo", {"text": "hi"})]

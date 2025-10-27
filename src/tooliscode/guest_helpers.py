@@ -60,7 +60,6 @@ class ToolRuntime:
         return cls._instance
 
     def __init__(self) -> None:
-        # Avoid re-initialising singleton state.
         pass
 
     def invoke(self, function_name: str, args: dict, *, timeout: float) -> dict[str, Any]:

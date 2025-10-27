@@ -25,7 +25,7 @@ def _trace(msg: str) -> None:
         print(f"[wasi_server] {msg}", file=sys.stderr, flush=True)
 
 
-def _lp_write(stdin_stream: Any, obj: dict) -> None:
+def _lp_write(stdin_stream: Any, obj: dict[str, Any]) -> None:
     payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     header = f"{len(payload)}\n".encode("utf-8")
     _trace(f"[host] lp_write header={len(header)} payload={len(payload)}")
